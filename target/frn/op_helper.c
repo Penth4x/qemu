@@ -298,10 +298,39 @@ static inline void frn_rd_watch(CPUFRNState *e, uint32_t a)
     }
 }
 
+/* Read-override (FRN_FORCE="addr:val,addr:val,…", up to 8): return val for a
+ * read at addr. Lets me force a specific flag (e.g. the date-set bit) to a value
+ * to test a gate hypothesis without patching the ROM. Width-agnostic: the value
+ * is returned for the covering access. */
+#define FRN_FORCE_MAX 8
+static uint32_t frn_force_a[FRN_FORCE_MAX], frn_force_v[FRN_FORCE_MAX];
+static int frn_force_n = -1;
+static int frn_force_lookup(uint32_t a, uint32_t *out)
+{
+    if (frn_force_n < 0) {
+        frn_force_n = 0;
+        const char *s = getenv("FRN_FORCE");
+        while (s && *s && frn_force_n < FRN_FORCE_MAX) {
+            char *e1; unsigned long ad = strtoul(s, &e1, 16);
+            if (e1 == s || *e1 != ':') break;
+            char *e2; unsigned long va = strtoul(e1 + 1, &e2, 16);
+            frn_force_a[frn_force_n] = (uint32_t)ad;
+            frn_force_v[frn_force_n] = (uint32_t)va;
+            frn_force_n++;
+            s = (*e2 == ',') ? e2 + 1 : e2;
+        }
+    }
+    for (int i = 0; i < frn_force_n; i++) {
+        if (frn_force_a[i] == a) { *out = frn_force_v[i]; return 1; }
+    }
+    return 0;
+}
+
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
     frn_rd_hist(a);
     frn_rd_watch(e, a);
+    { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xff; }
     if (a == 0x4A) return (e->tmr_count >> 8) & 0xff;
     if (a == 0x4B) return e->tmr_count & 0xff;
     return cpu_ldub_data(e, a);
@@ -320,6 +349,7 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
     frn_rd_hist(a); frn_rd_watch(e, a);
+    { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xffff; }
     return cpu_lduw_be_data(e, a);
 }
 static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
@@ -327,6 +357,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
     frn_rd_hist(a); frn_rd_watch(e, a);
+    { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv; }
     return cpu_ldl_be_data(e, a);
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
