@@ -277,9 +277,31 @@ static void frn_snapshot(CPUFRNState *e)
  * Low control regs (<0x50) carry timer/DICR side effects and the timer-count
  * read (0x4A/0x4B), matching fremu's read_u8/write_u8; multi-byte accesses to
  * that window decompose to bytes so the side effects fire. */
+/* Read-watchpoint (FRN_RDWATCH=hex): log PC whenever the firmware reads from the
+ * 64-byte window at that address. Used to tell whether a code path (e.g. the
+ * "Date Adjust" string access) is ever reached. */
+static uint32_t frn_rdwatch = 0;
+static int frn_rdwatch_init = 0;
+static inline void frn_rd_watch(CPUFRNState *e, uint32_t a)
+{
+    if (!frn_rdwatch_init) {
+        frn_rdwatch_init = 1;
+        const char *s = getenv("FRN_RDWATCH");
+        if (s) frn_rdwatch = (uint32_t)strtoul(s, NULL, 16);
+    }
+    if (frn_rdwatch && a >= frn_rdwatch && a < frn_rdwatch + 64) {
+        static int n;
+        if (n++ < 40) {
+            fprintf(frn_tr_out ? frn_tr_out : stderr,
+                    "[rdwatch] read 0x%08x from pc~0x%08x\n", a, e->pc);
+        }
+    }
+}
+
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
     frn_rd_hist(a);
+    frn_rd_watch(e, a);
     if (a == 0x4A) return (e->tmr_count >> 8) & 0xff;
     if (a == 0x4B) return e->tmr_count & 0xff;
     return cpu_ldub_data(e, a);
@@ -297,14 +319,14 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
-    frn_rd_hist(a);
+    frn_rd_hist(a); frn_rd_watch(e, a);
     return cpu_lduw_be_data(e, a);
 }
 static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
-    frn_rd_hist(a);
+    frn_rd_hist(a); frn_rd_watch(e, a);
     return cpu_ldl_be_data(e, a);
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
@@ -626,8 +648,8 @@ void HELPER(frn_interp)(CPUFRNState *env)
         if (pc >= 0x10439674 && pc <= 0x104396d0) {
             static uint32_t _vs[16]; static int _vn;
             int f = 0; for (int k = 0; k < _vn; k++) if (_vs[k] == r[ri]) f = 1;
-            if (!f && _vn < 16) { _vs[_vn++] = r[ri];
-                fprintf(stderr, "[task1-vtable] pc=%08x -> method=%08x (obj r4=%08x)\n", pc, r[ri], r[4]); }
+            if (frn_tr_irq && !f && _vn < 16) { _vs[_vn++] = r[ri];
+                fprintf(frn_tr_out ? frn_tr_out : stderr, "[task1-vtable] pc=%08x -> method=%08x (obj r4=%08x)\n", pc, r[ri], r[4]); }
         }
         do_call(env, r[ri], pc + 2, 0); break;
     }   /* call @ri */
@@ -763,9 +785,9 @@ void HELPER(frn_interp)(CPUFRNState *env)
             uint32_t svc = env->regs[12];
             int f = 0;
             for (int k = 0; k < _ns; k++) if (_seen[k] == svc) { f = 1; break; }
-            if (!f && _ns < 128) {
+            if (frn_tr_irq && !f && _ns < 128) {
                 _seen[_ns++] = svc;
-                fprintf(stderr, "[int40] service r12=%08x  r4=%08x r5=%08x  pc=%08x\n",
+                fprintf(frn_tr_out ? frn_tr_out : stderr, "[int40] service r12=%08x  r4=%08x r5=%08x  pc=%08x\n",
                         svc, env->regs[4], env->regs[5], pc);
             }
         }
