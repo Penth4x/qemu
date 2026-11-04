@@ -1,0 +1,7 @@
+# Fujitsu FR instruction decode (skeleton — to be filled from fremu._execute).
+# FR base instructions are 16-bit; ldi:20/ldi:32 and some transfers pull extra
+# half/words. For the bring-up skeleton we decode NOP; everything else falls
+# through to a generic "advance + end TB" path in translate.c (placeholder),
+# to be replaced by the full port.
+
+nop     1001 1111 1010 0000     # 0x9FA0

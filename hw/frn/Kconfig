@@ -1,0 +1,4 @@
+config FRN_K10D
+    bool
+    default y
+    depends on FRN
