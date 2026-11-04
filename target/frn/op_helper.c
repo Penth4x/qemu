@@ -588,13 +588,51 @@ static void frn_watch_tick(CPUFRNState *e)
     e->wc_pending = 1;
 }
 
+/* Generic periodic-IRQ firer (FRN_FIRE_VECS="43,46,47,..."): fire each listed
+ * vector periodically once the firmware has enabled its ICR (level != 0x1f).
+ * This is RE-from-firmware: the K10D's imaging peripherals have no datasheet, so
+ * we discover which autonomous interrupts advance the boot by firing the armed
+ * ones (exactly how the watch-counter/vec41 was found) and watching the effect. */
+#define FRN_FIRE_MAX 16
+static uint32_t frn_fire_vec[FRN_FIRE_MAX], frn_fire_div[FRN_FIRE_MAX];
+static uint8_t  frn_fire_pending[FRN_FIRE_MAX];
+static int frn_fire_n = -1;
+static long frn_fire_period = 200000;
+static void frn_fire_tick(CPUFRNState *e)
+{
+    if (frn_fire_n < 0) {
+        frn_fire_n = 0;
+        const char *s = getenv("FRN_FIRE_VECS");
+        const char *p = getenv("FRN_FIRE_PERIOD"); if (p) frn_fire_period = strtol(p, NULL, 0);
+        while (s && *s && frn_fire_n < FRN_FIRE_MAX) {
+            char *end; long v = strtol(s, &end, 0);
+            if (end == s) break;
+            frn_fire_vec[frn_fire_n++] = (uint32_t)v;
+            s = (*end == ',') ? end + 1 : end;
+        }
+    }
+    for (int i = 0; i < frn_fire_n; i++) {
+        uint32_t icr = cpu_ldub_data(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
+        if (icr == 0x1F) continue;            /* not enabled yet */
+        if (++frn_fire_div[i] < (uint32_t)frn_fire_period) continue;
+        frn_fire_div[i] = 0;
+        frn_fire_pending[i] = 1;
+    }
+}
+
 static void frn_deliver(CPUFRNState *e)
 {
     if (!e->i_flag) return;
-    uint32_t lev[3], vec[3]; int kind[3], n = 0;
+    uint32_t lev[3 + FRN_FIRE_MAX], vec[3 + FRN_FIRE_MAX]; int kind[3 + FRN_FIRE_MAX], n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
     if (e->dicr_pending)  { lev[n] = cpu_ldub_data(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
     if (e->wc_pending)    { lev[n] = cpu_ldub_data(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
+    for (int i = 0; i < frn_fire_n; i++) {
+        if (frn_fire_pending[i]) {
+            lev[n] = cpu_ldub_data(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
+            vec[n] = frn_fire_vec[i]; kind[n] = 10 + i; n++;
+        }
+    }
     if (n == 0) return;
     /* insertion sort ascending by level (highest priority = lowest number first) */
     for (int i = 1; i < n; i++) {
@@ -611,16 +649,17 @@ static void frn_deliver(CPUFRNState *e)
         if (!(handler >= FW_BASE && handler < FW_END)) continue;
         if (kind[i] == 0) e->pending_valid = 0;  /* DICR stays until FW clears 0x44 */
         if (kind[i] == 2) e->wc_pending = 0;
+        if (kind[i] >= 10) frn_fire_pending[kind[i] - 10] = 0;
         set_sflag(e, 0);
         push32(e, pack_ps(e));
         push32(e, e->pc);
         e->ilm = lev[i];
         e->pc = handler;
         if (frn_tr_irq) {
-            static const char *nm[3] = { "timer", "dicr", "watch-cnt" };
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
-                    "from 0x%08x\n", vec[i], nm[kind[i]], handler, lev[i],
-                    rd32(e, e->regs[15]));
+                    "from 0x%08x\n", vec[i],
+                    kind[i]==0?"timer":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":"fire",
+                    handler, lev[i], rd32(e, e->regs[15]));
         }
         return;
     }
@@ -635,6 +674,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
     if (!env->delay_armed) {       /* instruction boundary (not a delay slot) */
         frn_timer_tick(env);
         frn_watch_tick(env);
+        frn_fire_tick(env);
         frn_deliver(env);          /* may set env->pc to an ISR handler */
     }
     frn_snapshot(env);
