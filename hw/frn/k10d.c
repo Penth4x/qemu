@@ -24,6 +24,17 @@
  */
 static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
 {
+    /* FRN_MMIO_ZERO=lo-hi : return 0 instead of all-ones in that range (test a
+     * "first-boot blank persistent store" hypothesis for where the date-set flag
+     * is sourced). */
+    static long zlo = -2, zhi = 0;
+    if (zlo == -2) {
+        const char *s = getenv("FRN_MMIO_ZERO"); zlo = -1;
+        if (s) { char *e; zlo = strtol(s, &e, 16); if (*e=='-') zhi = strtol(e+1, NULL, 16); }
+    }
+    if (zlo >= 0 && addr >= (uint64_t)zlo && addr < (uint64_t)zhi) {
+        return 0;
+    }
     /* fremu: MMIO ranges read as all-ones (mmio_default); everything else is
      * RAM that reads 0 when unwritten. */
     if ((addr >= 0x01000000 && addr < 0x10000000) ||
