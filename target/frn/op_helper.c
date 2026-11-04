@@ -289,11 +289,16 @@ static inline void frn_rd_watch(CPUFRNState *e, uint32_t a)
         const char *s = getenv("FRN_RDWATCH");
         if (s) frn_rdwatch = (uint32_t)strtoul(s, NULL, 16);
     }
-    if (frn_rdwatch && a >= frn_rdwatch && a < frn_rdwatch + 64) {
-        static int n;
-        if (n++ < 40) {
-            fprintf(frn_tr_out ? frn_tr_out : stderr,
-                    "[rdwatch] read 0x%08x from pc~0x%08x\n", a, e->pc);
+    if (frn_rdwatch) {
+        static long len = -1;
+        if (len < 0) { const char *l = getenv("FRN_RDWATCH_LEN"); len = l ? strtol(l, NULL, 0) : 64; }
+        if (a >= frn_rdwatch && a < frn_rdwatch + len) {
+            static int n;
+            if (n++ < 200) {
+                fprintf(frn_tr_out ? frn_tr_out : stderr,
+                        "[rdwatch] read 0x%08x (+0x%lx) from pc~0x%08x\n",
+                        a, (long)(a - frn_rdwatch), e->pc);
+            }
         }
     }
 }
@@ -335,9 +340,32 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
     if (a == 0x4B) return e->tmr_count & 0xff;
     return cpu_ldub_data(e, a);
 }
+/* Write-watchpoint (FRN_WRWATCH=hex[,FRN_WRWATCH_LEN]): log PC+value on writes
+ * into the window — to find the code that populates a struct (e.g. the settings
+ * load that reveals the persistent-store interface). */
+static uint32_t frn_wrwatch = 0; static long frn_wrwatch_len = 0; static int frn_wrwatch_init = 0;
+static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
+{
+    if (!frn_wrwatch_init) {
+        frn_wrwatch_init = 1;
+        const char *s = getenv("FRN_WRWATCH");
+        if (s) frn_wrwatch = (uint32_t)strtoul(s, NULL, 16);
+        const char *l = getenv("FRN_WRWATCH_LEN"); frn_wrwatch_len = l ? strtol(l, NULL, 0) : 4;
+    }
+    if (frn_wrwatch && a >= frn_wrwatch && a < frn_wrwatch + frn_wrwatch_len) {
+        static int n;
+        if (n++ < 200) {
+            fprintf(frn_tr_out ? frn_tr_out : stderr,
+                    "[wrwatch] write 0x%08x (+0x%lx) = 0x%08x from pc~0x%08x\n",
+                    a, (long)(a - frn_wrwatch), v, e->pc);
+        }
+    }
+}
+
 static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     frn_wr_hist(a);
+    frn_wr_watch(e, a, v);
     cpu_stb_data(e, a, v & 0xff);
     if (a == 0x44) {
         e->dicr_pending = v & 1;
@@ -363,7 +391,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 8); wr8(e, a + 1, v); return; }
-    frn_wr_hist(a);
+    frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff);
 }
 uint64_t frn_lcd_writes;      /* debug: count of LCD-reg writes */
@@ -372,7 +400,7 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 24); wr8(e, a + 1, v >> 16);
                     wr8(e, a + 2, v >> 8); wr8(e, a + 3, v); return; }
-    frn_wr_hist(a);
+    frn_wr_hist(a); frn_wr_watch(e, a, v);
     if (a >= 0x40100000 && a < 0x40101000) {
         frn_lcd_writes++;
         if (a == 0x40100800 && v && !frn_lcd_scanout) {
