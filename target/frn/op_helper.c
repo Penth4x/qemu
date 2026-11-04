@@ -573,8 +573,17 @@ void HELPER(frn_interp)(CPUFRNState *env)
         if ((long)r[6] >= minr6 && (maxhits == 0 || hits < maxhits)) {
             hits++;
             fprintf(frn_tr_out, "[call] 0x%08x  r4=0x%08x r5=0x%08x r6=0x%08x "
-                    "r7=0x%08x r8=0x%08x r13=0x%08x r14=0x%08x  rp=0x%08x\n",
-                    pc, r[4], r[5], r[6], r[7], r[8], r[13], r[14], env->rp);
+                    "r7=0x%08x r8=0x%08x r13=0x%08x r14=0x%08x  rp=0x%08x sp=0x%08x\n",
+                    pc, r[4], r[5], r[6], r[7], r[8], r[13], r[14], env->rp, r[15]);
+            /* walk the stack for firmware-range return addresses = call chain */
+            fprintf(frn_tr_out, "       stack:");
+            for (int k = 0; k < 96; k++) {
+                uint32_t sv = cpu_ldl_be_data(env, r[15] + k * 4);
+                if (sv >= FW_BASE && sv < FW_END) {
+                    fprintf(frn_tr_out, " 0x%08x", sv);
+                }
+            }
+            fprintf(frn_tr_out, "\n");
         }
     }
     uint32_t w = rd16(env, pc);
