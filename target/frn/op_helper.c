@@ -137,6 +137,84 @@ static void frn_hist_dump(const char *path, int idx)
     fprintf(stderr, "[frn] PC histogram %d -> %s\n", idx, fn);
 }
 
+/* Write-address histogram (inspectability): FRN_WRHIST counts writes per 4 KiB
+ * page so the most-written region (the framebuffer) is found without guessing. */
+static uint32_t *frn_wrhist;
+static int frn_wrhist_on = -1;
+static inline void frn_wr_hist(uint32_t a)
+{
+    if (frn_wrhist_on < 0) {
+        frn_wrhist_on = getenv("FRN_WRHIST") ? 1 : 0;
+        if (frn_wrhist_on) {
+            frn_wrhist = calloc(1u << 20, sizeof(uint32_t));
+            if (!frn_wrhist) frn_wrhist_on = 0;
+        }
+    }
+    if (frn_wrhist_on) frn_wrhist[(a >> 12) & 0xfffff]++;
+}
+
+/* Read-address histogram for MMIO polls (FRN_RDHIST): the register the firmware
+ * busy-polls (the wait gate) shows up as the hottest MMIO read. */
+static uint32_t *frn_rdhist;
+static int frn_rdhist_on = -1;
+static inline int frn_is_mmio(uint32_t a)
+{
+    return (a >= 0x40000000u && a < 0x50000000u) ||
+           (a >= 0x67000000u && a < 0x67100000u) ||
+           (a >= 0x01000000u && a < 0x10000000u);
+}
+static inline void frn_rd_hist(uint32_t a)
+{
+    if (frn_rdhist_on < 0) {
+        frn_rdhist_on = getenv("FRN_RDHIST") ? 1 : 0;
+        if (frn_rdhist_on) {
+            frn_rdhist = calloc(1u << 20, sizeof(uint32_t));
+            if (!frn_rdhist) frn_rdhist_on = 0;
+        }
+    }
+    if (frn_rdhist_on && frn_is_mmio(a)) frn_rdhist[(a >> 4) & 0xfffff]++;
+}
+
+static void frn_rdhist_dump(const char *path, int idx)
+{
+    if (!frn_rdhist_on || !frn_rdhist) return;
+    char fn[512];
+    snprintf(fn, sizeof fn, "%s.rdhist.%d", path, idx);
+    FILE *f = fopen(fn, "w");
+    if (!f) return;
+    for (int top = 0; top < 40; top++) {
+        uint32_t best = 0, bi = 0;
+        for (uint32_t i = 0; i < (1u << 20); i++) {
+            if (frn_rdhist[i] > best) { best = frn_rdhist[i]; bi = i; }
+        }
+        if (best == 0) break;
+        fprintf(f, "0x%08x  %u reads\n", bi << 4, best);
+        frn_rdhist[bi] = 0;
+    }
+    fclose(f);
+    fprintf(stderr, "[frn] MMIO read histogram %d -> %s\n", idx, fn);
+}
+
+static void frn_wrhist_dump(const char *path, int idx)
+{
+    if (!frn_wrhist_on || !frn_wrhist) return;
+    char fn[512];
+    snprintf(fn, sizeof fn, "%s.wrhist.%d", path, idx);
+    FILE *f = fopen(fn, "w");
+    if (!f) return;
+    for (int top = 0; top < 40; top++) {
+        uint32_t best = 0, bi = 0;
+        for (uint32_t i = 0; i < (1u << 20); i++) {
+            if (frn_wrhist[i] > best) { best = frn_wrhist[i]; bi = i; }
+        }
+        if (best == 0) break;
+        fprintf(f, "0x%08x  %u writes\n", bi << 12, best);
+        frn_wrhist[bi] = 0;
+    }
+    fclose(f);
+    fprintf(stderr, "[frn] write histogram %d -> %s\n", idx, fn);
+}
+
 static void frn_snapshot(CPUFRNState *e)
 {
     static const char *path;
@@ -190,6 +268,8 @@ static void frn_snapshot(CPUFRNState *e)
         fprintf(stderr, "[frn] WRAM snapshot %d -> %s\n", idx, fn);
     }
     frn_hist_dump(path, idx);
+    frn_wrhist_dump(path, idx);
+    frn_rdhist_dump(path, idx);
     idx++;
 }
 
@@ -199,12 +279,14 @@ static void frn_snapshot(CPUFRNState *e)
  * that window decompose to bytes so the side effects fire. */
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
+    frn_rd_hist(a);
     if (a == 0x4A) return (e->tmr_count >> 8) & 0xff;
     if (a == 0x4B) return e->tmr_count & 0xff;
     return cpu_ldub_data(e, a);
 }
 static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 {
+    frn_wr_hist(a);
     cpu_stb_data(e, a, v & 0xff);
     if (a == 0x44) {
         e->dicr_pending = v & 1;
@@ -215,17 +297,20 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
+    frn_rd_hist(a);
     return cpu_lduw_be_data(e, a);
 }
 static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
+    frn_rd_hist(a);
     return cpu_ldl_be_data(e, a);
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 8); wr8(e, a + 1, v); return; }
+    frn_wr_hist(a);
     cpu_stw_be_data(e, a, v & 0xffff);
 }
 uint64_t frn_lcd_writes;      /* debug: count of LCD-reg writes */
@@ -234,6 +319,7 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 24); wr8(e, a + 1, v >> 16);
                     wr8(e, a + 2, v >> 8); wr8(e, a + 3, v); return; }
+    frn_wr_hist(a);
     if (a >= 0x40100000 && a < 0x40101000) {
         frn_lcd_writes++;
         if (a == 0x40100800 && v && !frn_lcd_scanout) {
