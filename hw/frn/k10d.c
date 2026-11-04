@@ -130,7 +130,11 @@ static uint64_t frn_wc_read(void *opaque, hwaddr off, unsigned size)
 {
     uint8_t reg[0x10] = { 0 };
     reg[0x06] = 0x80;              /* +0x06 = 0x8000: IRQ pending */
-    /* +0x04 left 0x0000: clock NOT set (first boot) */
+    /* +0x04 bit15 = "clock set?". Default NOT set (first boot). Env override to
+     * compare the clock-set branch (does it drive the rear-UI redraw?). */
+    static int clkset = -1;
+    if (clkset < 0) clkset = getenv("FRN_CLOCK_SET") ? 1 : 0;
+    if (clkset) reg[0x04] = 0x80;  /* +0x04 = 0x8000: clock IS set */
     uint64_t v = 0;
     for (unsigned i = 0; i < size; i++) {
         v = (v << 8) | reg[(off + i) & 0xf];   /* big-endian */
