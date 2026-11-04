@@ -84,6 +84,14 @@ static uint8_t frn_p67[0x1000];
  */
 static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
 {
+    static int p67log = -1;
+    if (p67log < 0) p67log = getenv("FRN_LOG_P67") ? 1 : 0;
+    if (p67log && !(off >= 0x24 && off <= 0x33)) {   /* skip the status/handshake block */
+        uint64_t rv = 0;
+        for (unsigned i = 0; i < size; i++) rv = (rv << 8) | frn_p67[(off + i) & 0xfff];
+        fprintf(stderr, "[p67rd] off 0x%03x sz%u = 0x%0*llx\n",
+                (unsigned)off, size, size * 2, (unsigned long long)rv);
+    }
     if (off <= 0x31 && off + size > 0x30) {
         static uint32_t frame;
         frame++;
