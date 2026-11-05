@@ -22,6 +22,32 @@
  * benign for status polls). Stateful peripherals (timer, 0x67000000 block,
  * LCD) are added later as higher-priority device regions over this.
  */
+/* Unmapped-access trap (FRN_LOG_UNMAPPED): every access that falls through to the
+ * background handler is to a region we have NOT modeled -- reads return a default
+ * (all-ones or 0) and writes are DROPPED. Log each distinct address once, with the
+ * firmware PC, so missing peripheral/RAM regions announce themselves instead of
+ * silently misbehaving (Andrew d308). */
+static inline uint32_t frn_cur_pc(void)
+{
+    return current_cpu ? FRN_CPU(current_cpu)->env.pc : 0;
+}
+static void frn_log_unmapped(const char *kind, uint32_t addr, uint32_t val, unsigned size)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("FRN_LOG_UNMAPPED") ? 1 : 0;
+    if (!on) return;
+    static uint32_t seen[2048]; static int ns, nlog;
+    if (nlog > 16000) return;
+    for (int i = 0; i < ns; i++) if (seen[i] == addr) return;   /* dedup by addr */
+    if (ns < 2048) seen[ns++] = addr;
+    /* tag: is it in the "all-ones default MMIO" window (partly expected) or truly dark? */
+    int periph = (addr >= 0x40000000 && addr < 0x50000000) ||
+                 (addr >= 0x67000000 && addr < 0x67001000);
+    fprintf(stderr, "[UNMAPPED %s%s] 0x%08x = 0x%08x (sz%u) pc~0x%08x\n",
+            kind, periph ? "/periph" : "/DARK", addr, val, size, frn_cur_pc());
+    nlog++;
+}
+
 static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
 {
     /* FRN_MMIO_ZERO=lo-hi : return 0 instead of all-ones in that range (test a
@@ -88,6 +114,7 @@ static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
         (addr >= 0x67000000 && addr < 0x67001000)) {
         return 0xffffffffffffffffULL;
     }
+    frn_log_unmapped("RD", (uint32_t)addr, 0, size);   /* truly-dark read -> 0 */
     return 0;
 }
 static void frn_bg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
@@ -111,6 +138,7 @@ static void frn_bg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         fprintf(stderr, "[disp] wr 0x%08x = 0x%08x (sz%u)%s\n",
                 (uint32_t)addr, (uint32_t)val, size, tag);
     }
+    frn_log_unmapped("WR", (uint32_t)addr, (uint32_t)val, size);  /* dropped write */
 }
 static const MemoryRegionOps frn_bg_ops = {
     .read = frn_bg_read,
@@ -237,7 +265,10 @@ static const MemoryRegionOps frn_wc_ops = {
 #define K10D_ROM_BASE   0x10000000
 #define K10D_ROM_SIZE   0x01000000      /* 16 MiB window (firmware ~8.4 MiB) */
 #define K10D_SDRAM_BASE 0x80000000
-#define K10D_SDRAM_SIZE 0x04000000      /* 64 MiB */
+#define K10D_SDRAM_SIZE 0x10000000      /* 256 MiB: firmware writes task stacks/TCB
+                                         * pointers up to ~0x8fffffff (kernel init
+                                         * pc 0x1000e858/e876); 64 MiB dropped them
+                                         * -> corrupt kernel structs -> reloop (d308) */
 #define K10D_WRAM_BASE  0x6a000000
 #define K10D_WRAM_SIZE  0x00100000      /* 1 MiB work RAM */
 #define K10D_ENTRY      0x10008000
@@ -292,6 +323,31 @@ static void k10d_init(MachineState *machine)
     memory_region_init_ram(wram, NULL, "k10d.wram", K10D_WRAM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, K10D_WRAM_BASE, wram);
+
+    /* State/SRAM banks the firmware WRITES during app-main init and the peripheral
+     * ISR handlers READ back (d308). Previously unmapped -> writes dropped, reads 0,
+     * so every handler status-gate failed and no task ever woke. 0x6b000000 is a 2nd
+     * SRAM bank adjacent to WRAM (written @app-main 0x10439558..); 0x5c000000 is a
+     * display/peripheral state block (written @0x1043ec6e/0x10440488). Back them as
+     * RAM so the firmware's own writes persist and the handlers read real state. */
+    MemoryRegion *sram6b = g_new(MemoryRegion, 1);
+    memory_region_init_ram(sram6b, NULL, "k10d.sram6b", 0x00100000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x6b000000, sram6b);
+    MemoryRegion *blk5c = g_new(MemoryRegion, 1);
+    memory_region_init_ram(blk5c, NULL, "k10d.blk5c", 0x00100000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x5c000000, blk5c);
+    /* More dark regions the firmware uses (found via FRN_LOG_UNMAPPED, d308):
+     * 0x50000000 written first in app-main (0x10439428, 3-channel controller);
+     * 0x66000000 / 0x68000000 read by 0x1044b/0x104ab code. Back as RAM. */
+    MemoryRegion *blk50 = g_new(MemoryRegion, 1);
+    memory_region_init_ram(blk50, NULL, "k10d.blk50", 0x00100000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x50000000, blk50);
+    MemoryRegion *blk66 = g_new(MemoryRegion, 1);
+    memory_region_init_ram(blk66, NULL, "k10d.blk66", 0x00100000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x66000000, blk66);
+    MemoryRegion *blk68 = g_new(MemoryRegion, 1);
+    memory_region_init_ram(blk68, NULL, "k10d.blk68", 0x00100000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x68000000, blk68);
 
     if (!machine->firmware) {
         error_report("k10d: supply the firmware with -bios FWDC162B.BIN");
