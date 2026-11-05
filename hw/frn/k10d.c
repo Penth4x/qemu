@@ -195,7 +195,17 @@ static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
     if (off <= 0x31 && off + size > 0x30) {
         static uint32_t frame;
         frame++;
-        uint16_t sync = 0x8000 | (frame & 1);   /* ready + toggling parity */
+        /* 0x67000030 bit15 (0x8000) = "frame/screen ready". A prior model forced it
+         * ALWAYS set, but the rear-UI draw guard FUN_1044b35e reads exactly this bit
+         * to decide whether to draw the active screen -- and with it forced set, the
+         * draw runs before any screen object exists (screenmgr+0x11c == NULL),
+         * dereferences NULL and derails to pc 0x1c -> reset -> the boot reloop. On
+         * real HW bit15 is 0 until the display pipeline is actually configured. Keep
+         * the toggling parity (bit0) for frame-sync polls; leave bit15 clear unless
+         * FRN_P67_READY forces it back (to compare the old behavior). */
+        static int ready = -1;
+        if (ready < 0) ready = getenv("FRN_P67_READY") ? 0x8000 : 0;
+        uint16_t sync = (uint16_t)ready | (frame & 1);
         frn_p67[0x30] = sync >> 8;
         frn_p67[0x31] = sync & 0xff;
     }
