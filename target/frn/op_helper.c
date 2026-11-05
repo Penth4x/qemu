@@ -183,6 +183,45 @@ static inline void frn_rd_hist(uint32_t a)
     if (frn_rdhist_on && frn_is_mmio(a)) frn_rdhist[(a >> 4) & 0xfffff]++;
 }
 
+/* Read-before-write detector (FRN_LOG_RBW=lo-hi): find addresses the firmware READS
+ * before ever WRITING them in [lo,hi) -- i.e. DATA it expects to have been pre-
+ * initialized (by a boot-ROM stage we don't emulate). Logs addr+PC+value, deduped.
+ * Byte-granularity written-bitmap over the window. (Andrew: "missing RAM/ROM data".) */
+static uint8_t *frn_rbw_bm; static uint32_t frn_rbw_lo, frn_rbw_hi; static int frn_rbw_init = 0;
+static void frn_rbw_setup(void)
+{
+    frn_rbw_init = 1;
+    const char *s = getenv("FRN_LOG_RBW");
+    if (!s) return;
+    char *e; frn_rbw_lo = (uint32_t)strtoul(s, &e, 16);
+    frn_rbw_hi = (*e == '-') ? (uint32_t)strtoul(e + 1, NULL, 16) : frn_rbw_lo + 0x800000;
+    size_t n = (frn_rbw_hi - frn_rbw_lo + 7) / 8;
+    frn_rbw_bm = calloc(n, 1);
+    if (!frn_rbw_bm) frn_rbw_lo = frn_rbw_hi = 0;
+}
+static inline void frn_rbw_mark(uint32_t a, unsigned sz)
+{
+    if (!frn_rbw_init) frn_rbw_setup();
+    if (!frn_rbw_bm) return;
+    for (unsigned i = 0; i < sz; i++) { uint32_t x = a + i;
+        if (x >= frn_rbw_lo && x < frn_rbw_hi) { uint32_t o = x - frn_rbw_lo; frn_rbw_bm[o >> 3] |= 1u << (o & 7); } }
+}
+static inline void frn_rbw_check(CPUFRNState *e, uint32_t a, unsigned sz, uint32_t v)
+{
+    if (!frn_rbw_init) frn_rbw_setup();
+    if (!frn_rbw_bm) return;
+    if (a < frn_rbw_lo || a >= frn_rbw_hi) return;
+    uint32_t o = a - frn_rbw_lo;
+    if (frn_rbw_bm[o >> 3] & (1u << (o & 7))) return;     /* already written */
+    /* mark now so we log each address only once */
+    for (unsigned i = 0; i < sz; i++) { uint32_t x = a + i; if (x >= frn_rbw_lo && x < frn_rbw_hi) {
+        uint32_t oo = x - frn_rbw_lo; frn_rbw_bm[oo >> 3] |= 1u << (oo & 7); } }
+    static int n;
+    if (n++ < 4000)
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[rbw] read-before-write 0x%08x (sz%u) = 0x%08x  pc~0x%08x\n", a, sz, v, e->pc);
+}
+
 static void frn_rdhist_dump(const char *path, int idx)
 {
     if (!frn_rdhist_on || !frn_rdhist) return;
@@ -346,7 +385,7 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xff; }
     if (a == 0x4A) return (e->tmr_count >> 8) & 0xff;
     if (a == 0x4B) return e->tmr_count & 0xff;
-    return cpu_ldub_data(e, a);
+    { uint32_t r = cpu_ldub_data(e, a); frn_rbw_check(e, a, 1, r); return r; }
 }
 /* Write-watchpoint (FRN_WRWATCH=hex[,FRN_WRWATCH_LEN]): log PC+value on writes
  * into the window — to find the code that populates a struct (e.g. the settings
@@ -377,7 +416,7 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     frn_wr_hist(a);
     frn_wr_watch(e, a, v);
-    cpu_stb_data(e, a, v & 0xff);
+    cpu_stb_data(e, a, v & 0xff); frn_rbw_mark(a, 1);
     if (a == 0x44) {
         e->dicr_pending = v & 1;
     } else if (a >= 0x48 && a <= 0x4F) {
@@ -389,7 +428,7 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xffff; }
-    return cpu_lduw_be_data(e, a);
+    { uint32_t r = cpu_lduw_be_data(e, a); frn_rbw_check(e, a, 2, r); return r; }
 }
 static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
@@ -397,13 +436,13 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv; }
-    return cpu_ldl_be_data(e, a);
+    { uint32_t r = cpu_ldl_be_data(e, a); frn_rbw_check(e, a, 4, r); return r; }
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 8); wr8(e, a + 1, v); return; }
     frn_wr_hist(a); frn_wr_watch(e, a, v);
-    cpu_stw_be_data(e, a, v & 0xffff);
+    cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
 }
 uint64_t frn_lcd_writes;      /* debug: count of LCD-reg writes */
 uint32_t frn_lcd_scanout;     /* debug: scanout base once programmed */
@@ -420,7 +459,7 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
                     v, (unsigned long long)frn_lcd_writes);
         }
     }
-    cpu_stl_be_data(e, a, v);
+    cpu_stl_be_data(e, a, v); frn_rbw_mark(a, 4);
 }
 
 /* ---- arithmetic helpers (match fremu free helpers) ---- */
