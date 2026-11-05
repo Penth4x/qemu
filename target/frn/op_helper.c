@@ -724,24 +724,41 @@ static void frn_deliver(CPUFRNState *e)
  * eventflag drives the UI/compositor. Returns to idle after (rp=idle). */
 #define FRN_IDLE_PC 0x10491512u
 #define FRN_SETFLG  0x10459708u
+#define FRN_WAKE_SCRATCH 0x8ff00000u   /* unused high SDRAM: holds the injected flag id */
 static void frn_wake_inject(CPUFRNState *e)
 {
     static int init = 0, done = 0; static uint32_t flagobj = 0, pattern = 0xffffffff;
-    static long delay = 2000, cnt = 0;
+    static long delay = 2000, cnt = 0; static long flagid = -1, call_fn = -1, call_arg = 0;
     if (!init) { init = 1;
         const char *s = getenv("FRN_WAKE"); if (s) flagobj = (uint32_t)strtoul(s, NULL, 16);
+        const char *i = getenv("FRN_WAKE_ID"); if (i) flagid = strtol(i, NULL, 0);
         const char *p = getenv("FRN_WAKE_PAT"); if (p) pattern = (uint32_t)strtoul(p, NULL, 16);
         const char *d = getenv("FRN_WAKE_AT"); if (d) delay = strtol(d, NULL, 0);
+        const char *c = getenv("FRN_CALL");
+        if (c) { char *e2; call_fn = strtol(c, &e2, 16); if (*e2==':') call_arg = strtol(e2+1, NULL, 16); }
     }
-    if (!flagobj || done) return;
+    if ((!flagobj && flagid < 0 && call_fn < 0) || done) return;
     if (e->pc != FRN_IDLE_PC) return;       /* only from the settled idle task */
     if (cnt++ < delay) return;              /* let it idle a bit first */
     done = 1;
-    e->regs[4] = flagobj; e->regs[5] = pattern; e->regs[6] = 0; e->regs[7] = 0;
+    if (call_fn > 0) {                       /* call an arbitrary func(arg) from idle */
+        e->regs[4] = (uint32_t)call_arg; e->regs[5] = 0; e->regs[6] = 0; e->regs[7] = 0;
+        e->rp = FRN_IDLE_PC; e->pc = (uint32_t)call_fn;
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[wake] inject CALL 0x%08lx(0x%08lx) from idle\n", call_fn, call_arg);
+        return;
+    }
+    uint32_t pobj = flagobj;
+    if (flagid >= 0) {                      /* raw id: stash it at scratch, point param_1 there */
+        cpu_stw_be_data(e, FRN_WAKE_SCRATCH, (uint16_t)flagid);
+        pobj = FRN_WAKE_SCRATCH;
+    }
+    e->regs[4] = pobj; e->regs[5] = pattern; e->regs[6] = 0; e->regs[7] = 0;
     e->rp = FRN_IDLE_PC;                     /* return to idle after set_flg */
     e->pc = FRN_SETFLG;
     fprintf(frn_tr_out ? frn_tr_out : stderr,
-            "[wake] inject set_flg(flagobj=0x%08x, pat=0x%08x) from idle\n", flagobj, pattern);
+            "[wake] inject set_flg(param1=0x%08x id=%ld pat=0x%08x) from idle\n",
+            pobj, flagid, pattern);
 }
 
 void HELPER(frn_interp)(CPUFRNState *env)
