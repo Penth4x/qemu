@@ -716,6 +716,34 @@ static void frn_deliver(CPUFRNState *e)
     }
 }
 
+/* UI-wake diagnostic (FRN_WAKE=flagobj_hex[,FRN_WAKE_PAT=pattern][,FRN_WAKE_AT=idle-hits]):
+ * once the firmware has settled into the idle task (pc=0x10491512), inject a call to
+ * the set_flg wrapper FUN_10459708(flagobj, pattern, 0, 0) to wake a task blocked on
+ * that eventflag. Breaks the circular init cascade (no peripheral events -> no task
+ * runs -> nothing gets wired) by posting the first event by hand, to discover which
+ * eventflag drives the UI/compositor. Returns to idle after (rp=idle). */
+#define FRN_IDLE_PC 0x10491512u
+#define FRN_SETFLG  0x10459708u
+static void frn_wake_inject(CPUFRNState *e)
+{
+    static int init = 0, done = 0; static uint32_t flagobj = 0, pattern = 0xffffffff;
+    static long delay = 2000, cnt = 0;
+    if (!init) { init = 1;
+        const char *s = getenv("FRN_WAKE"); if (s) flagobj = (uint32_t)strtoul(s, NULL, 16);
+        const char *p = getenv("FRN_WAKE_PAT"); if (p) pattern = (uint32_t)strtoul(p, NULL, 16);
+        const char *d = getenv("FRN_WAKE_AT"); if (d) delay = strtol(d, NULL, 0);
+    }
+    if (!flagobj || done) return;
+    if (e->pc != FRN_IDLE_PC) return;       /* only from the settled idle task */
+    if (cnt++ < delay) return;              /* let it idle a bit first */
+    done = 1;
+    e->regs[4] = flagobj; e->regs[5] = pattern; e->regs[6] = 0; e->regs[7] = 0;
+    e->rp = FRN_IDLE_PC;                     /* return to idle after set_flg */
+    e->pc = FRN_SETFLG;
+    fprintf(frn_tr_out ? frn_tr_out : stderr,
+            "[wake] inject set_flg(flagobj=0x%08x, pat=0x%08x) from idle\n", flagobj, pattern);
+}
+
 void HELPER(frn_interp)(CPUFRNState *env)
 {
     uint32_t *r = env->regs;
@@ -728,6 +756,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
         frn_fire_tick(env);
         frn_autotimer_tick(env);
         frn_deliver(env);          /* may set env->pc to an ISR handler */
+        frn_wake_inject(env);      /* diagnostic: post a chosen eventflag from idle */
     }
     frn_snapshot(env);
     uint32_t pc = env->pc;
