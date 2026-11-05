@@ -35,6 +35,52 @@ static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
     if (zlo >= 0 && addr >= (uint64_t)zlo && addr < (uint64_t)zhi) {
         return 0;
     }
+    /* FRN_LOG_RD=lo-hi : log each distinct read address in range (capped) to find
+     * the key/button input poll register. */
+    {
+        static long rlo = -2, rhi = 0; static uint32_t seen[512]; static int ns, nlog;
+        if (rlo == -2) { const char *s = getenv("FRN_LOG_RD"); rlo = -1;
+            if (s) { char *e; rlo = strtol(s,&e,16); if (*e=='-') rhi = strtol(e+1,NULL,16); } }
+        if (rlo >= 0 && addr >= (uint64_t)rlo && addr < (uint64_t)rhi && nlog < 4000) {
+            int f = 0; for (int i=0;i<ns;i++) if (seen[i]==(uint32_t)addr){f=1;break;}
+            if (!f && ns<512) { seen[ns++]=(uint32_t)addr;
+                fprintf(stderr, "[rd] 0x%08x\n", (uint32_t)addr); nlog++; }
+        }
+    }
+    /* FRN_KEYPULSE=addr:andmask:after:dur[,addr:...] — edge-triggered key
+     * injection into the 0x40060000 GPIO key-port block. The key driver
+     * (0x10451100-0x10451230) reads each 16-bit port every scan and detects a
+     * press as an active-low HIGH->LOW transition (debounced over several
+     * scans). A static FRN_FORCE can't make an edge, so we PULSE: counting reads
+     * of the exact `addr`, for reads [after, after+dur) we return
+     * (0xffff & ~andmask) (masked bits driven LOW = pressed); otherwise 0xffff
+     * (released). That yields release->press->release so the debounce fires.
+     * Units of after/dur = number of reads of that addr (~1 per frame scan). */
+    {
+        static int kp_init = 0;
+        static uint32_t kp_a[8], kp_m[8]; static long kp_after[8], kp_dur[8], kp_cnt[8];
+        static int kp_n = 0;
+        if (!kp_init) { kp_init = 1;
+            const char *s = getenv("FRN_KEYPULSE");
+            while (s && *s && kp_n < 8) {
+                char *e; uint32_t a = (uint32_t)strtoul(s, &e, 16);
+                if (e == s || *e != ':') break;
+                uint32_t m = (uint32_t)strtoul(e+1, &e, 16); if (*e==':') e++;
+                long af = strtol(e, &e, 0); if (*e==':') e++;
+                long du = strtol(e, &e, 0);
+                kp_a[kp_n]=a; kp_m[kp_n]=m; kp_after[kp_n]=af; kp_dur[kp_n]=du; kp_cnt[kp_n]=0; kp_n++;
+                s = (*e==',') ? e+1 : e;
+            }
+        }
+        for (int i = 0; i < kp_n; i++) {
+            if ((uint32_t)addr == kp_a[i]) {
+                long c = kp_cnt[i]++;
+                if (c >= kp_after[i] && c < kp_after[i] + kp_dur[i])
+                    return (uint64_t)(0xffffu & ~kp_m[i]);
+                return 0xffffu;
+            }
+        }
+    }
     /* fremu: MMIO ranges read as all-ones (mmio_default); everything else is
      * RAM that reads 0 when unwritten. */
     if ((addr >= 0x01000000 && addr < 0x10000000) ||
@@ -95,6 +141,21 @@ static uint8_t frn_p67[0x1000];
  */
 static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
 {
+    /* FRN_P67BTN="off:val,off:val" : override p67 bytes on read (inject button
+     * state). Lets us test whether the 0x67000000 chip is the button source and
+     * find the MENU/4-way bits, to drive menus in-emulator. */
+    static int btn_init = 0; static uint8_t btn_val[0x40]; static uint8_t btn_set[0x40];
+    if (!btn_init) { btn_init = 1;
+        const char *s = getenv("FRN_P67BTN");
+        while (s && *s) { char *e; long o = strtol(s,&e,16); if (e==s||*e!=':') break;
+            long v = strtol(e+1,&e,16); if (o>=0&&o<0x40){btn_val[o]=(uint8_t)v;btn_set[o]=1;}
+            s = (*e==',')?e+1:e; }
+    }
+    if (off < 0x40) { for (unsigned i=0;i<size;i++) if (btn_set[(off+i)&0x3f]) {
+        /* a byte in this access is overridden: build the value with overrides */
+        uint64_t v=0; for (unsigned j=0;j<size;j++){ uint32_t a=(off+j)&0xfff;
+            uint8_t b = (a<0x40 && btn_set[a])?btn_val[a]:frn_p67[a]; v=(v<<8)|b; }
+        return v; } }
     static int p67log = -1;
     if (p67log < 0) p67log = getenv("FRN_LOG_P67") ? 1 : 0;
     if (p67log && !(off >= 0x24 && off <= 0x33)) {   /* skip the status/handshake block */

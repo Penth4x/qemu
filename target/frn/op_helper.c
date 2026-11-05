@@ -124,14 +124,22 @@ static void frn_hist_dump(const char *path, int idx)
     snprintf(fn, sizeof fn, "%s.hist.%d", path, idx);
     FILE *f = fopen(fn, "w");
     if (!f) return;
-    for (int top = 0; top < 50; top++) {
-        uint32_t best = 0, bi = 0;
+    /* FRN_HIST_ALL=1 dumps every non-zero bucket (for full boot-chain coverage);
+     * otherwise the top 50 by hit-count. */
+    if (getenv("FRN_HIST_ALL")) {
         for (uint32_t i = 0; i < FRN_HIST_SZ; i++) {
-            if (frn_hist[i] > best) { best = frn_hist[i]; bi = i; }
+            if (frn_hist[i]) fprintf(f, "0x%08x  %u\n", 0x10000000u | (i << 4), frn_hist[i]);
         }
-        if (best == 0) break;
-        fprintf(f, "0x%08x  %u\n", 0x10000000u | (bi << 4), best);
-        frn_hist[bi] = 0;   /* consume so next iteration finds the next */
+    } else {
+        for (int top = 0; top < 50; top++) {
+            uint32_t best = 0, bi = 0;
+            for (uint32_t i = 0; i < FRN_HIST_SZ; i++) {
+                if (frn_hist[i] > best) { best = frn_hist[i]; bi = i; }
+            }
+            if (best == 0) break;
+            fprintf(f, "0x%08x  %u\n", 0x10000000u | (bi << 4), best);
+            frn_hist[bi] = 0;
+        }
     }
     fclose(f);
     fprintf(stderr, "[frn] PC histogram %d -> %s\n", idx, fn);
@@ -353,8 +361,11 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
         const char *l = getenv("FRN_WRWATCH_LEN"); frn_wrwatch_len = l ? strtol(l, NULL, 0) : 4;
     }
     if (frn_wrwatch && a >= frn_wrwatch && a < frn_wrwatch + frn_wrwatch_len) {
+        static int nzinit = 0, nzonly = 0;
+        if (!nzinit) { nzinit = 1; nzonly = getenv("FRN_WRWATCH_NZ") ? 1 : 0; }
+        if (nzonly && v == 0) return;
         static int n;
-        if (n++ < 200) {
+        if (n++ < 20000) {
             fprintf(frn_tr_out ? frn_tr_out : stderr,
                     "[wrwatch] write 0x%08x (+0x%lx) = 0x%08x from pc~0x%08x\n",
                     a, (long)(a - frn_wrwatch), v, e->pc);
@@ -620,10 +631,43 @@ static void frn_fire_tick(CPUFRNState *e)
     }
 }
 
+/* Built-in autonomous (free-running) timers the firmware unmasks. On real
+ * hardware the 32-bit free-run timer (vec43) and the base timers (vec48/49/50)
+ * count on their own clock and raise their IRQ periodically once enabled; they
+ * are NOT kicked by a task. So, exactly like the watch-counter (vec41), fire
+ * each one periodically once the firmware unmasks its ICR (level != 0x1f). This
+ * is the peripheral IMPLEMENTATION (always on), distinct from the FRN_FIRE_VECS
+ * debug knob. Disable with FRN_NO_AUTOTIMER; retune with FRN_AUTOTIMER_PERIOD.
+ * vec41 stays handled by frn_watch_tick. */
+#define FRN_AUTOTIMER_N 4
+static const uint32_t frn_autotimer_vec[FRN_AUTOTIMER_N] = { 43, 48, 49, 50 };
+static uint32_t frn_autotimer_div[FRN_AUTOTIMER_N];
+static uint8_t  frn_autotimer_pending[FRN_AUTOTIMER_N];
+static long frn_autotimer_period = 200000;
+static int  frn_autotimer_init = 0;
+static void frn_autotimer_tick(CPUFRNState *e)
+{
+    if (!frn_autotimer_init) {
+        frn_autotimer_init = 1;
+        const char *p = getenv("FRN_AUTOTIMER_PERIOD");
+        if (p) frn_autotimer_period = strtol(p, NULL, 0);
+        if (getenv("FRN_NO_AUTOTIMER")) frn_autotimer_period = 0;   /* disable */
+    }
+    if (frn_autotimer_period <= 0) return;
+    for (int i = 0; i < FRN_AUTOTIMER_N; i++) {
+        uint32_t icr = cpu_ldub_data(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
+        if (icr == 0x1F) continue;                 /* not unmasked by firmware */
+        if (++frn_autotimer_div[i] < (uint32_t)frn_autotimer_period) continue;
+        frn_autotimer_div[i] = 0;
+        frn_autotimer_pending[i] = 1;
+    }
+}
+
 static void frn_deliver(CPUFRNState *e)
 {
     if (!e->i_flag) return;
-    uint32_t lev[3 + FRN_FIRE_MAX], vec[3 + FRN_FIRE_MAX]; int kind[3 + FRN_FIRE_MAX], n = 0;
+    uint32_t lev[3 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[3 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    int kind[3 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
     if (e->dicr_pending)  { lev[n] = cpu_ldub_data(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
     if (e->wc_pending)    { lev[n] = cpu_ldub_data(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
@@ -631,6 +675,12 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_fire_pending[i]) {
             lev[n] = cpu_ldub_data(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
             vec[n] = frn_fire_vec[i]; kind[n] = 10 + i; n++;
+        }
+    }
+    for (int i = 0; i < FRN_AUTOTIMER_N; i++) {
+        if (frn_autotimer_pending[i]) {
+            lev[n] = cpu_ldub_data(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
+            vec[n] = frn_autotimer_vec[i]; kind[n] = 30 + i; n++;
         }
     }
     if (n == 0) return;
@@ -649,7 +699,8 @@ static void frn_deliver(CPUFRNState *e)
         if (!(handler >= FW_BASE && handler < FW_END)) continue;
         if (kind[i] == 0) e->pending_valid = 0;  /* DICR stays until FW clears 0x44 */
         if (kind[i] == 2) e->wc_pending = 0;
-        if (kind[i] >= 10) frn_fire_pending[kind[i] - 10] = 0;
+        if (kind[i] >= 10 && kind[i] < 30) frn_fire_pending[kind[i] - 10] = 0;
+        if (kind[i] >= 30) frn_autotimer_pending[kind[i] - 30] = 0;
         set_sflag(e, 0);
         push32(e, pack_ps(e));
         push32(e, e->pc);
@@ -658,7 +709,7 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_tr_irq) {
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
                     "from 0x%08x\n", vec[i],
-                    kind[i]==0?"timer":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":"fire",
+                    kind[i]==0?"timer":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]>=30?"autotmr":"fire",
                     handler, lev[i], rd32(e, e->regs[15]));
         }
         return;
@@ -675,6 +726,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
         frn_timer_tick(env);
         frn_watch_tick(env);
         frn_fire_tick(env);
+        frn_autotimer_tick(env);
         frn_deliver(env);          /* may set env->pc to an ISR handler */
     }
     frn_snapshot(env);
