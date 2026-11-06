@@ -401,6 +401,10 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xff; }
     if (a == 0x4A) return (e->tmr_count >> 8) & 0xff;
     if (a == 0x4B) return e->tmr_count & 0xff;
+    /* Debug UART status reg at 0x60: bit3 (0x08) = TX buffer ready/empty. The
+     * firmware's serial puts() (FUN_103b764c) busy-waits on this before writing
+     * the TX data reg 0x61. Unmodeled -> infinite wait. Report TX always ready. */
+    if (a == 0x60) return 0x08;
     { uint32_t r = cpu_ldub_data(e, a); frn_rbw_check(e, a, 1, r); return r; }
 }
 /* Write-watchpoint (FRN_WRWATCH=hex[,FRN_WRWATCH_LEN]): log PC+value on writes
@@ -455,6 +459,12 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
         e->dicr_pending = v & 1;
     } else if (a >= 0x48 && a <= 0x4F) {
         frn_timer_reg_written(e);
+    } else if (a == 0x61) {
+        /* Debug UART TX data reg: capture the firmware's serial output so boot
+         * progress / debug banners are visible. Gated by FRN_UART (default on). */
+        static int uinit = -1; if (uinit < 0) uinit = getenv("FRN_UART_OFF") ? 0 : 1;
+        if (uinit) { fputc(v & 0xff, frn_tr_out ? frn_tr_out : stderr);
+                     fflush(frn_tr_out ? frn_tr_out : stderr); }
     }
 }
 static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
@@ -774,8 +784,9 @@ static void frn_deliver(CPUFRNState *e)
         if (kind[i] == 2) e->wc_pending = 0;
         if (kind[i] >= 10 && kind[i] < 30) frn_fire_pending[kind[i] - 10] = 0;
         if (kind[i] >= 30) frn_autotimer_pending[kind[i] - 30] = 0;
+        uint32_t saved_ps = pack_ps(e);  /* FR: save pre-trap PS (user S=1) BEFORE entering system mode */
         set_sflag(e, 0);
-        push32(e, pack_ps(e));
+        push32(e, saved_ps);
         push32(e, e->pc);
         e->ilm = lev[i];
         e->pc = handler;
@@ -908,6 +919,19 @@ void HELPER(frn_interp)(CPUFRNState *env)
     frn_snapshot(env);
     uint32_t pc = env->pc;
     frn_hist_tick(pc);
+    /* FRN_LOG_USER: holistic handover map — log every transition of the live S-flag
+     * (env->sf): 0->1 = entry to USER mode (userland handover), 1->0 = back to system.
+     * If sf never becomes 1, the kernel never hands any task to userland (the root). */
+    { static int lu = -1; if (lu < 0) lu = getenv("FRN_LOG_USER") ? 1 : 0;
+      if (lu) { static int prev = -1; static int n = 0;
+        int cur = (int)(env->sf & 1);
+        if (cur != prev) {
+            if (n++ < 60) fprintf(frn_tr_out?frn_tr_out:stderr,
+                "[user] sf %d->%d at pc=0x%08x curtask=0x%08x\n", prev<0?0:prev, cur, pc,
+                cpu_ldl_be_data(env, 0x6a003758u));
+            prev = cur;
+        }
+      } }
     /* FRN_LOG_FLG: log the eventflag id (low16 of *(r4)) at wai_flg/set_flg/clr_flg entry,
      * to discover the REAL ids the firmware waits/sets (e.g. what task23 blocks on). */
     { static int lf = -1; if (lf < 0) lf = getenv("FRN_LOG_FLG") ? 1 : 0;
@@ -1245,8 +1269,9 @@ void HELPER(frn_interp)(CPUFRNState *env)
         uint32_t ea = env->tbr + 0x3FC - (td * 4);
         uint32_t vec = rd32(env, ea);
         if (vec >= FW_BASE && vec < FW_END) {
+            uint32_t saved_ps = pack_ps(env);  /* FR: save pre-trap PS (user S=1) BEFORE entering system mode */
             set_sflag(env, 0);
-            push32(env, pack_ps(env));
+            push32(env, saved_ps);
             push32(env, pc + 2);
             env->i_flag = 0;
             env->pc = vec;
