@@ -359,6 +359,20 @@ static void k10d_init(MachineState *machine)
     memory_region_init_ram(blk68, NULL, "k10d.blk68", 0x00100000, &error_fatal);
     memory_region_add_subregion(sysmem, 0x68000000, blk68);
 
+    /* OSDC (on-screen display controller) register file at 0x40000000 (d309).
+     * Plane-base regs 0x40000000/0x40004000/0x40008000, control+palette ~0x40040000.
+     * Previously these READ as 0xffffffff (frn_bg_read fallthrough), so the firmware's
+     * display-config read-modify-write operated on garbage. Back the CONFIG sub-range
+     * 0x40000000..0x40070000 (plane bases 0x40000000/4000/8000, control+palette
+     * ~0x40040000) as RAM so reads return written values. Deliberately stop at
+     * 0x40070000: the status register 0x4007000c is POLLED by app-main (pc 0x10439600)
+     * and must read "ready" — leaving 0x40070000+ to fall through to the 0xffffffff
+     * background keeps that poll passing (readback-0 there regresses app-main into an
+     * infinite spin). Priority 0 sits below the 0x40090000 watch-counter overlay. */
+    MemoryRegion *osdc = g_new(MemoryRegion, 1);
+    memory_region_init_ram(osdc, NULL, "k10d.osdc", 0x00070000, &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, 0x40000000, osdc, 0);
+
     if (!machine->firmware) {
         error_report("k10d: supply the firmware with -bios FWDC162B.BIN");
         exit(1);

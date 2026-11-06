@@ -348,6 +348,22 @@ static inline void frn_rd_watch(CPUFRNState *e, uint32_t a)
             }
         }
     }
+    /* FRN_RDAT_PC=hex: when the PC is within [pc, pc+0x20), log the distinct
+     * addresses this instruction window reads (the word a poll-loop spins on). */
+    {
+        static int rdat_init = 0; static uint32_t rdat_pc = 0;
+        if (!rdat_init) { rdat_init = 1; const char *s = getenv("FRN_RDAT_PC");
+            if (s) rdat_pc = (uint32_t)strtoul(s, NULL, 16); }
+        if (rdat_pc && e->pc >= rdat_pc && e->pc < rdat_pc + 0x20) {
+            static uint32_t seen[32]; static int nseen = 0; int found = 0;
+            for (int i = 0; i < nseen; i++) if (seen[i] == a) { found = 1; break; }
+            if (!found && nseen < 32) {
+                seen[nseen++] = a;
+                fprintf(frn_tr_out ? frn_tr_out : stderr,
+                        "[rdat] pc 0x%08x reads addr 0x%08x\n", e->pc, a);
+            }
+        }
+    }
 }
 
 /* Read-override (FRN_FORCE="addr:val,addr:val,…", up to 8): return val for a
@@ -408,6 +424,24 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
             fprintf(frn_tr_out ? frn_tr_out : stderr,
                     "[wrwatch] write 0x%08x (+0x%lx) = 0x%08x from pc~0x%08x\n",
                     a, (long)(a - frn_wrwatch), v, e->pc);
+        }
+    }
+    /* FRN_WRAT_PC=hex[,len]: when PC is within [pc, pc+len) (default 0x40), log
+     * the distinct addresses this code window WRITES — finds a rasterizer's
+     * pixel target. Histograms targets into 0x10000-granular buckets. */
+    {
+        static int init = 0; static uint32_t wrat_pc = 0; static long wrat_len = 0x40;
+        if (!init) { init = 1; const char *s = getenv("FRN_WRAT_PC");
+            if (s) { char *e2; wrat_pc = (uint32_t)strtoul(s, &e2, 16);
+                     if (e2 && *e2==',') wrat_len = strtol(e2+1, NULL, 0); } }
+        if (wrat_pc && e->pc >= wrat_pc && e->pc < wrat_pc + wrat_len) {
+            static uint32_t bk[64]; static uint32_t cnt[64]; static int nb = 0;
+            uint32_t b = a & 0xffff0000u; int i;
+            for (i = 0; i < nb; i++) if (bk[i] == b) { cnt[i]++; break; }
+            if (i == nb && nb < 64) { bk[nb] = b; cnt[nb] = 1; nb++;
+                fprintf(frn_tr_out ? frn_tr_out : stderr,
+                        "[wrat] pc-window writes region 0x%08x (first val 0x%08x from pc 0x%08x)\n",
+                        b, v, e->pc); }
         }
     }
 }
@@ -762,42 +796,98 @@ static void frn_deliver(CPUFRNState *e)
  * runs -> nothing gets wired) by posting the first event by hand, to discover which
  * eventflag drives the UI/compositor. Returns to idle after (rp=idle). */
 #define FRN_IDLE_PC 0x10491512u
-#define FRN_SETFLG  0x10459708u
+#define FRN_SETFLG  0x104596ccu   /* real set_flg wrapper (d309 Sable): set_flg(short* idptr, pat). NOT 0x10459708=wai_flg */
 #define FRN_WAKE_SCRATCH 0x8ff00000u   /* unused high SDRAM: holds the injected flag id */
 static void frn_wake_inject(CPUFRNState *e)
 {
     static int init = 0, done = 0; static uint32_t flagobj = 0, pattern = 0xffffffff;
-    static long delay = 2000, cnt = 0; static long flagid = -1, call_fn = -1, call_arg = 0;
+    static long delay = 2000, cnt = 0, next_fire = 0, period = 0, fires = 0, maxfires = 0;
+    static long flagid = -1, call_fn = -1, call_arg = 0;
+    static long call_fn2 = -1, call_arg2 = 0, gap2 = 3000;  /* optional 2nd sequential call after the 1st returns to idle */
+    static uint32_t setflg_addr = FRN_SETFLG;
     if (!init) { init = 1;
         const char *s = getenv("FRN_WAKE"); if (s) flagobj = (uint32_t)strtoul(s, NULL, 16);
         const char *i = getenv("FRN_WAKE_ID"); if (i) flagid = strtol(i, NULL, 0);
         const char *p = getenv("FRN_WAKE_PAT"); if (p) pattern = (uint32_t)strtoul(p, NULL, 16);
         const char *d = getenv("FRN_WAKE_AT"); if (d) delay = strtol(d, NULL, 0);
+        const char *pe = getenv("FRN_WAKE_PERIOD"); if (pe) period = strtol(pe, NULL, 0);   /* re-fire every N idle hits (emulate the key-scan timer tick) */
+        const char *mf = getenv("FRN_WAKE_MAXFIRES"); if (mf) maxfires = strtol(mf, NULL, 0);
+        const char *sf = getenv("FRN_SETFLG"); if (sf) setflg_addr = (uint32_t)strtoul(sf, NULL, 16);
         const char *c = getenv("FRN_CALL");
         if (c) { char *e2; call_fn = strtol(c, &e2, 16); if (*e2==':') call_arg = strtol(e2+1, NULL, 16); }
+        const char *c2 = getenv("FRN_CALL2");
+        if (c2) { char *e2; call_fn2 = strtol(c2, &e2, 16); if (*e2==':') call_arg2 = strtol(e2+1, NULL, 16); }
+        const char *g2 = getenv("FRN_CALL2_GAP"); if (g2) gap2 = strtol(g2, NULL, 0);
+        next_fire = delay;
     }
     if ((!flagobj && flagid < 0 && call_fn < 0) || done) return;
     if (e->pc != FRN_IDLE_PC) return;       /* only from the settled idle task */
-    if (cnt++ < delay) return;              /* let it idle a bit first */
-    done = 1;
+    if (cnt++ < next_fire) return;          /* wait until the next scheduled fire */
+    /* schedule next fire: periodic (if period>0 and under maxfires) else one-shot */
+    if (call_fn2 > 0 && fires == 0) next_fire = cnt + gap2;   /* schedule the 2nd sequential call */
+    else if (period > 0 && (maxfires == 0 || fires + 1 < maxfires)) next_fire = cnt + period;
+    else done = 1;
+    fires++;
     if (call_fn > 0) {                       /* call an arbitrary func(arg) from idle */
-        e->regs[4] = (uint32_t)call_arg; e->regs[5] = 0; e->regs[6] = 0; e->regs[7] = 0;
-        e->rp = FRN_IDLE_PC; e->pc = (uint32_t)call_fn;
+        long cfn = (fires == 2 && call_fn2 > 0) ? call_fn2 : call_fn;
+        long carg = (fires == 2 && call_fn2 > 0) ? call_arg2 : call_arg;
+        e->regs[4] = (uint32_t)carg; e->regs[5] = 0; e->regs[6] = 0; e->regs[7] = 0;
+        /* optional extra register args for non-standard ABIs (e.g. TA_ACT uses r8/r9) */
+        { const char *s5=getenv("FRN_CALL_R5"); if(s5) e->regs[5]=(uint32_t)strtoul(s5,NULL,16);
+          const char *s8=getenv("FRN_CALL_R8"); if(s8) e->regs[8]=(uint32_t)strtoul(s8,NULL,16);
+          const char *s9=getenv("FRN_CALL_R9"); if(s9) e->regs[9]=(uint32_t)strtoul(s9,NULL,16);
+          const char *s12=getenv("FRN_CALL_R12"); if(s12) e->regs[12]=(uint32_t)strtoul(s12,NULL,16);
+          const char *ssp=getenv("FRN_CALL_SP"); if(ssp) e->regs[15]=(uint32_t)strtoul(ssp,NULL,16); }
+        e->rp = FRN_IDLE_PC; e->pc = (uint32_t)cfn;
         fprintf(frn_tr_out ? frn_tr_out : stderr,
-                "[wake] inject CALL 0x%08lx(0x%08lx) from idle\n", call_fn, call_arg);
+                "[wake] inject CALL 0x%08lx(r4=0x%08lx r8=0x%08x r9=0x%08x) from idle (fire %ld)\n",
+                cfn, carg, e->regs[8], e->regs[9], fires);
         return;
     }
     uint32_t pobj = flagobj;
-    if (flagid >= 0) {                      /* raw id: stash it at scratch, point param_1 there */
-        cpu_stw_be_data(e, FRN_WAKE_SCRATCH, (uint16_t)flagid);
+    if (flagid >= 0) {                      /* raw id: stash as 32-bit word (set_flg does ld @r4,r4 then extsh = low16), point param_1 there */
+        cpu_stl_be_data(e, FRN_WAKE_SCRATCH, (uint32_t)(flagid & 0xffff));
         pobj = FRN_WAKE_SCRATCH;
     }
     e->regs[4] = pobj; e->regs[5] = pattern; e->regs[6] = 0; e->regs[7] = 0;
     e->rp = FRN_IDLE_PC;                     /* return to idle after set_flg */
-    e->pc = FRN_SETFLG;
+    e->pc = setflg_addr;
     fprintf(frn_tr_out ? frn_tr_out : stderr,
-            "[wake] inject set_flg(param1=0x%08x id=%ld pat=0x%08x) from idle\n",
-            pobj, flagid, pattern);
+            "[wake] inject set_flg@0x%08x(param1=0x%08x id=%ld pat=0x%08x) fire %ld\n",
+            setflg_addr, pobj, flagid, pattern, fires);
+}
+
+/* FRN_POKE="addr:val[,addr:val]" : one-shot (or periodic via FRN_POKE_PERIOD) memory writes,
+ * applied from the settled idle task. Used to feed the RTOS operational-phase trigger, e.g.
+ * FRN_POKE=6a0036c4:1 writes task-id 1 into the act_tsk trigger slot so the tick handler
+ * activates it through the firmware's own path. FRN_POKE_AT=idle-hits delay, FRN_POKE_SZ=1/2/4. */
+static void frn_poke_tick(CPUFRNState *e)
+{
+    static int init = 0; static int n = 0; static uint32_t pa[32], pv[32];
+    static long delay = 1500, cnt = 0, next = 0, period = 0, fires = 0, maxf = 0; static int sz = 4;
+    if (!init) { init = 1;
+        const char *s = getenv("FRN_POKE");
+        while (s && *s && n < 32) { char *e2; uint32_t a=(uint32_t)strtoul(s,&e2,16);
+            if (e2==s||*e2!=':') break; uint32_t v=(uint32_t)strtoul(e2+1,&e2,16);
+            pa[n]=a; pv[n]=v; n++; s=(*e2==',')?e2+1:e2; }
+        const char *d=getenv("FRN_POKE_AT"); if(d) delay=strtol(d,NULL,0);
+        const char *p=getenv("FRN_POKE_PERIOD"); if(p) period=strtol(p,NULL,0);
+        const char *m=getenv("FRN_POKE_MAXFIRES"); if(m) maxf=strtol(m,NULL,0);
+        const char *z=getenv("FRN_POKE_SZ"); if(z) sz=atoi(z);
+        next=delay;
+    }
+    if (n==0) return;
+    if (e->pc != 0x10491512u) return;
+    if (cnt++ < next) return;
+    if (period>0 && (maxf==0 || fires+1<maxf)) next=cnt+period; else next=0x7fffffffffffffffL;
+    fires++;
+    for (int i=0;i<n;i++){
+        if (sz==1) cpu_stb_data(e,pa[i],(uint8_t)pv[i]);
+        else if (sz==2) cpu_stw_be_data(e,pa[i],(uint16_t)pv[i]);
+        else cpu_stl_be_data(e,pa[i],pv[i]);
+    }
+    fprintf(frn_tr_out?frn_tr_out:stderr,"[poke] fire %ld: wrote %d pair(s) sz%d (e.g. 0x%08x=0x%08x)\n",
+            fires,n,sz,pa[0],pv[0]);
 }
 
 void HELPER(frn_interp)(CPUFRNState *env)
@@ -813,10 +903,69 @@ void HELPER(frn_interp)(CPUFRNState *env)
         frn_autotimer_tick(env);
         frn_deliver(env);          /* may set env->pc to an ISR handler */
         frn_wake_inject(env);      /* diagnostic: post a chosen eventflag from idle */
+        frn_poke_tick(env);        /* diagnostic: one-shot/periodic memory writes from idle */
     }
     frn_snapshot(env);
     uint32_t pc = env->pc;
     frn_hist_tick(pc);
+    /* FRN_LOG_FLG: log the eventflag id (low16 of *(r4)) at wai_flg/set_flg/clr_flg entry,
+     * to discover the REAL ids the firmware waits/sets (e.g. what task23 blocks on). */
+    { static int lf = -1; if (lf < 0) lf = getenv("FRN_LOG_FLG") ? 1 : 0;
+      if (lf && (pc == 0x10459708u || pc == 0x104596ccu || pc == 0x104596e6u)) {
+        uint32_t idp = r[4]; uint32_t idw = 0;
+        if (idp >= 0x80000000u && idp < 0x84000000u) idw = cpu_ldl_be_data(env, idp);
+        else if (idp >= 0x6a000000u && idp < 0x6a100000u) idw = cpu_ldl_be_data(env, idp);
+        const char *nm = pc==0x10459708u?"wai_flg":(pc==0x104596ccu?"set_flg":"clr_flg");
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+            "[flg] %s id=0x%04x (idptr=0x%08x word=0x%08x) pat=0x%08x from rp~0x%08x\n",
+            nm, idw & 0xffff, idp, idw, r[5], env->rp);
+      } }
+    /* FRN_LOG_GATE: log the scheduler-start gate inputs each time rtos_can_dispatch
+     * (0x1000e758) or rtos_sched_start_gate (0x1000d208) runs, to see whether the gate
+     * ever passes (ret 0) and which term fails. FR is big-endian. */
+    { static int lg = -1; if (lg < 0) lg = getenv("FRN_LOG_GATE") ? 1 : 0;
+      if (lg && (pc == 0x1000e758u || pc == 0x1000d208u)) {
+        static int n;
+        if (n++ < 400) {
+            uint32_t ctxp = cpu_ldl_be_data(env, 0x6a003774u);
+            uint8_t d4d = 0, d4f = 0;
+            if (ctxp >= 0x6a000000u && ctxp < 0x6a100000u) {
+                d4d = cpu_ldub_data(env, ctxp + 0x4d);
+                d4f = cpu_ldub_data(env, ctxp + 0x4f);
+            } else if (ctxp >= 0x80000000u && ctxp < 0x90000000u) {
+                d4d = cpu_ldub_data(env, ctxp + 0x4d);
+                d4f = cpu_ldub_data(env, ctxp + 0x4f);
+            }
+            uint8_t aa8 = cpu_ldub_data(env, 0x6a003aa8u);
+            int d3a2 = (d4d == 0x1f && (d4f & 0x30) == 0x30) ? 0 : 1;
+            int gate = (d3a2 != 0 || aa8 != 0) ? 1 : 0;
+            fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[gate] %s ctx=0x%08x +0x4d=0x%02x +0x4f=0x%02x aa8=0x%02x d3a2=%d gate=%d %s from rp~0x%08x\n",
+                pc==0x1000e758u?"can_dispatch":"sched_start", ctxp, d4d, d4f, aa8, d3a2, gate,
+                gate? "IDLE":"SCHEDULE", env->rp);
+        }
+      } }
+    /* FRN_LOG_DRAW: count the natural-boot render-path milestones to find where the
+     * app-main-synchronous draw bails. r4 = first arg (the screen-mgr obj). */
+    { static int ld = -1; if (ld < 0) ld = getenv("FRN_LOG_DRAW") ? 1 : 0;
+      if (ld) {
+        static long c_disp, c_vis, c_mark, c_draw; static int shown;
+        if (pc == 0x10467a3eu) c_disp++;
+        else if (pc == 0x10448a08u) {
+            c_vis++;
+            uint32_t mgr = r[4]; uint8_t dc = 0;
+            if (mgr >= 0x80000000u && mgr < 0x90000000u) dc = cpu_ldub_data(env, mgr + 0xdc);
+            if (c_vis <= 12) fprintf(frn_tr_out?frn_tr_out:stderr,
+                "[draw] vis_gate mgr=0x%08x +0xdc=0x%02x (0=>can-mark)\n", mgr, dc);
+        }
+        else if (pc == 0x1044b346u) c_mark++;
+        else if (pc == 0x10481298u) c_draw++;
+        if (pc == 0x10491510u && !shown) { shown = 1;   /* reached idle: dump the tally */
+            fprintf(frn_tr_out?frn_tr_out:stderr,
+                "[draw] TALLY at idle: rear_draw_dispatch=%ld vis_gate=%ld mark_visible=%ld draw_substep=%ld\n",
+                c_disp, c_vis, c_mark, c_draw);
+        }
+      } }
     if (frn_tr_watch_n && frn_tr_watched(pc)) {
         static long minr6 = -1;
         if (minr6 < 0) {
@@ -859,6 +1008,35 @@ void HELPER(frn_interp)(CPUFRNState *env)
     uint32_t op = hi8;
 
     env->pc = pc + 2;   /* default advance; overridden by transfers */
+
+    /* FRN_ICALL_LO/HI=hex: log indirect calls (op 0x97 = call @r[ri]) over a PC
+     * window, flagging targets that are null/garbage/non-ROM — a broken vtable
+     * dispatch (object field uninitialized in the emulator) is the likely gate. */
+    if (op == 0x97) {
+        static int ic=0; static uint32_t lo=0,hi=0;
+        if (!ic){ic=1; const char*l=getenv("FRN_ICALL_LO");const char*h=getenv("FRN_ICALL_HI");
+            if(l)lo=(uint32_t)strtoul(l,NULL,16); if(h)hi=(uint32_t)strtoul(h,NULL,16);}
+        if (lo && pc>=lo && pc<hi){
+            uint32_t tgt=env->regs[ri];
+            int bad = !(tgt>=0x10000000u && tgt<0x10600000u);
+            fprintf(frn_tr_out?frn_tr_out:stderr,"[icall] pc=%08x call @r%d=%08x%s\n",
+                    pc,ri,tgt, bad?"  <<BAD TARGET":"");
+        }
+    }
+
+    /* FRN_DISAS_LO/HI=hex: per-instruction trace over a PC window — the real
+     * interpreter narrating its own opcode stream, so I can read a function's
+     * logic (e.g. act_tsk's bail) without a separate (fallible) disassembler. */
+    {
+        static int di = 0; static uint32_t dlo = 0, dhi = 0;
+        if (!di) { di = 1; const char *l = getenv("FRN_DISAS_LO"); const char *h = getenv("FRN_DISAS_HI");
+            if (l) dlo = (uint32_t)strtoul(l, NULL, 16); if (h) dhi = (uint32_t)strtoul(h, NULL, 16); }
+        if (dlo && pc >= dlo && pc < dhi) {
+            fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[dis] pc=%08x w=%04x op=%02x ri=%x(%08x) rj=%x(%08x) td=%02x\n",
+                pc, w, op, ri, env->regs[ri], rj, env->regs[rj], td);
+        }
+    }
 
     do {
     /* ---- full-word opcodes ---- */
@@ -1023,8 +1201,8 @@ void HELPER(frn_interp)(CPUFRNState *env)
             for (int k = 0; k < _ns; k++) if (_seen[k] == svc) { f = 1; break; }
             if (frn_tr_irq && !f && _ns < 128) {
                 _seen[_ns++] = svc;
-                fprintf(frn_tr_out ? frn_tr_out : stderr, "[int40] service r12=%08x  r4=%08x r5=%08x  pc=%08x\n",
-                        svc, env->regs[4], env->regs[5], pc);
+                fprintf(frn_tr_out ? frn_tr_out : stderr, "[int40] service r12=%08x  r4=%08x r5=%08x  pc=%08x  vec=%08x\n",
+                        svc, env->regs[4], env->regs[5], pc, rd32(env, env->tbr + 0x3FC - (td * 4)));
             }
         }
         uint32_t ea = env->tbr + 0x3FC - (td * 4);
@@ -1073,6 +1251,14 @@ void HELPER(frn_interp)(CPUFRNState *env)
     if (op == 0x0F) { uint32_t ea = r[15] - 4; wr32(env, ea, r[14]); r[14] = ea; r[15] = r[15] - td * 4; break; }
 
     /* ---- unknown: leave pc advanced by 2 (skeleton tolerance) ---- */
+    { static int lu=-1; static long ucnt=0;
+      if(lu<0) lu=getenv("FRN_LOG_UNK")?1:0;
+      if(lu){ uint32_t uw=rd16(env,pc);
+        /* only log in the kernel/scheduler/activation range to cut noise; set FRN_LOG_UNK=all for everything */
+        static int all=-1; if(all<0) all=getenv("FRN_LOG_UNK_ALL")?1:0;
+        if(all || (pc>=0x1000c000u && pc<=0x10012000u))
+          if(ucnt++ < 2000)
+            fprintf(frn_tr_out?frn_tr_out:stderr,"[unk] pc=%08x w=%04x\n", pc, uw); } }
     } while (0);
 
     if (had_pending) {
