@@ -945,6 +945,26 @@ void HELPER(frn_interp)(CPUFRNState *env)
                 gate? "IDLE":"SCHEDULE", env->rp);
         }
       } }
+    /* FRN_SET38=1: at the task frame-builder FUN_1000d3fe(entry=r4, sp=r5), set the
+     * task's TCB+0x38 (resume fn, which cre_tsk never sets) = its ENTRY (r4), so the
+     * dispatcher chain-walk resumes the sub-task into its body (first-run dispatch)
+     * instead of calling NULL. Finds id by matching sp against SP-array 0x6a0018c0.
+     * Skips id6 (garbage SP). Build: faithful first-run resume for sub-tasks. */
+    { static int s38 = -1; if (s38 < 0) s38 = getenv("FRN_SET38") ? 1 : 0;
+      if (s38 && pc == 0x1000d3feu) {
+        uint32_t entry = r[4], sp = r[5];
+        for (uint32_t id = 0; id < 34; id++) {
+            if (id == 6) continue;
+            uint32_t slot = cpu_ldl_be_data(env, 0x6a0018c0u + id * 4);
+            if (slot == sp && sp >= 0x6a000000u) {
+                uint32_t tcb38 = 0x6a001be8u + id * 0x44u + 0x38u;
+                cpu_stl_be_data(env, tcb38, entry);
+                static int nn; if (nn++ < 40) fprintf(frn_tr_out?frn_tr_out:stderr,
+                    "[set38] task%u TCB+0x38 <- entry 0x%08x (sp 0x%08x)\n", id, entry, sp);
+                break;
+            }
+        }
+      } }
     /* FRN_LOG_TEXT: dump the string drawn by glyph_draw FUN_10492fde (r5 = char*),
      * to capture the ACTUAL menu text the firmware renders (e.g. "Date Adjust"),
      * independent of whether the pixel composite reaches a scanout surface. */
