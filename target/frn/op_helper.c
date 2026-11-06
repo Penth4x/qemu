@@ -945,6 +945,23 @@ void HELPER(frn_interp)(CPUFRNState *env)
                 gate? "IDLE":"SCHEDULE", env->rp);
         }
       } }
+    /* FRN_LOG_TEXT: dump the string drawn by glyph_draw FUN_10492fde (r5 = char*),
+     * to capture the ACTUAL menu text the firmware renders (e.g. "Date Adjust"),
+     * independent of whether the pixel composite reaches a scanout surface. */
+    { static int lt = -1; if (lt < 0) lt = getenv("FRN_LOG_TEXT") ? 1 : 0;
+      if (lt && pc == 0x10492fdeu) {
+        static int n;
+        if (n++ < 300) {
+            uint32_t sp = r[5]; char s[80]; int k = 0;
+            if (sp >= 0x10000000u && sp < 0x90000000u) {
+                for (; k < 79; k++) { uint8_t c = cpu_ldub_data(env, sp + k); if (!c) break;
+                    s[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '.'; }
+            }
+            s[k] = 0;
+            if (k > 0) fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[text] glyph_draw r4=0x%08x str@0x%08x = \"%s\"\n", r[4], sp, s);
+        }
+      } }
     /* FRN_LOG_DRAW: count the natural-boot render-path milestones to find where the
      * app-main-synchronous draw bails. r4 = first arg (the screen-mgr obj). */
     { static int ld = -1; if (ld < 0) ld = getenv("FRN_LOG_DRAW") ? 1 : 0;
