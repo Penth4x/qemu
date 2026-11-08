@@ -12,6 +12,8 @@
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
+#include "hw/core/qdev.h"
+#include "hw/core/sysbus.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "cpu.h"
@@ -50,6 +52,12 @@ static void frn_log_unmapped(const char *kind, uint32_t addr, uint32_t val, unsi
 
 static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
 {
+    if (getenv("FRN_DBG_KEYRD")) {
+        static uint32_t seen2[64]; static int ns2;
+        int f=0; for(int i=0;i<ns2;i++) if(seen2[i]==(uint32_t)addr){f=1;break;}
+        if(!f && ns2<64){ seen2[ns2++]=(uint32_t)addr;
+            fprintf(stderr, "[bgrd] 0x%08x sz%u\n", (uint32_t)addr, size); }
+    }
     /* FRN_MMIO_ZERO=lo-hi : return 0 instead of all-ones in that range (test a
      * "first-boot blank persistent store" hypothesis for where the date-set flag
      * is sourced). */
@@ -101,8 +109,13 @@ static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
         for (int i = 0; i < kp_n; i++) {
             if ((uint32_t)addr == kp_a[i]) {
                 long c = kp_cnt[i]++;
-                if (c >= kp_after[i] && c < kp_after[i] + kp_dur[i])
+                if (c >= kp_after[i] && c < kp_after[i] + kp_dur[i]) {
+                    static int logged[8];
+                    if (!logged[i]) { logged[i] = 1;
+                        fprintf(stderr, "[keypulse] 0x%08x driven LOW (0x%04x) at read #%ld\n",
+                                kp_a[i], (unsigned)(0xffffu & ~kp_m[i]), c); }
                     return (uint64_t)(0xffffu & ~kp_m[i]);
+                }
                 return 0xffffu;
             }
         }
@@ -138,11 +151,70 @@ static void frn_bg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         fprintf(stderr, "[disp] wr 0x%08x = 0x%08x (sz%u)%s\n",
                 (uint32_t)addr, (uint32_t)val, size, tag);
     }
+    /* FRN_LOG_WR=lo-hi : log each distinct write address in range (capped). */
+    {
+        static long wlo = -2, whi = 0; static uint32_t wseen[512]; static int wns, wnlog;
+        if (wlo == -2) { const char *s = getenv("FRN_LOG_WR"); wlo = -1;
+            if (s) { char *e; wlo = strtol(s,&e,16); if (*e=='-') whi = strtol(e+1,NULL,16); } }
+        if (wlo >= 0 && addr >= (uint64_t)wlo && addr < (uint64_t)whi && wnlog < 4000) {
+            int f = 0; for (int i=0;i<wns;i++) if (wseen[i]==(uint32_t)addr){f=1;break;}
+            if (!f && wns<512) { wseen[wns++]=(uint32_t)addr;
+                fprintf(stderr, "[wr] 0x%08x = 0x%08x (sz%u)\n", (uint32_t)addr, (uint32_t)val, size); wnlog++; }
+        }
+    }
     frn_log_unmapped("WR", (uint32_t)addr, (uint32_t)val, size);  /* dropped write */
 }
 static const MemoryRegionOps frn_bg_ops = {
     .read = frn_bg_read,
     .write = frn_bg_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* Key/GPIO port device at 0x40060000 (0x40 bytes). Unlike frn_bg (which DROPS
+ * writes), this PERSISTS the firmware's writes - essential because the key driver
+ * read-modify-writes a key-state accumulator (0x4006001e) each scan; with dropped
+ * writes it never accumulates -> no key CHANGE is ever seen -> the change-triggered
+ * key decode never fires. Backing bytes init to 0xff (active-low keys = idle/not
+ * pressed). FRN_KEYPULSE drives chosen offsets LOW on read (a press edge) - matched
+ * on the ABSOLUTE address (0x40060000+off) to keep the env format consistent. */
+static uint8_t frn_keyram[0x40];
+static int frn_keyram_init;
+static uint64_t frn_key_read(void *opaque, hwaddr off, unsigned size)
+{
+    if (!frn_keyram_init) { memset(frn_keyram, 0xff, sizeof frn_keyram); frn_keyram_init = 1; }
+    uint32_t abs = 0x40060000u + (uint32_t)off;
+    /* FRN_KEYPULSE edge injection (same syntax as frn_bg_read, absolute addr). */
+    static int kp_init = 0;
+    static uint32_t kp_a[8], kp_m[8]; static long kp_after[8], kp_dur[8], kp_cnt[8];
+    static int kp_n = 0;
+    if (!kp_init) { kp_init = 1; const char *s = getenv("FRN_KEYPULSE");
+        while (s && *s && kp_n < 8) { char *e; uint32_t a = (uint32_t)strtoul(s,&e,16);
+            if (e==s || *e!=':') break; uint32_t m=(uint32_t)strtoul(e+1,&e,16); if(*e==':')e++;
+            long af=strtol(e,&e,0); if(*e==':')e++; long du=strtol(e,&e,0);
+            kp_a[kp_n]=a; kp_m[kp_n]=m; kp_after[kp_n]=af; kp_dur[kp_n]=du; kp_cnt[kp_n]=0; kp_n++;
+            s=(*e==',')?e+1:e; } }
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size; i++) {
+        uint32_t ba = abs + i; uint8_t byte = frn_keyram[(off + i) & 0x3f];
+        for (int k = 0; k < kp_n; k++) if (kp_a[k] == ba) {
+            long c = kp_cnt[k]++;
+            if (c >= kp_after[k] && c < kp_after[k] + kp_dur[k]) byte = (uint8_t)(0xff & ~kp_m[k]);
+        }
+        v = (v << 8) | byte;       /* big-endian */
+    }
+    return v;
+}
+static void frn_key_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    if (!frn_keyram_init) { memset(frn_keyram, 0xff, sizeof frn_keyram); frn_keyram_init = 1; }
+    for (unsigned i = 0; i < size; i++)
+        frn_keyram[(off + size - 1 - i) & 0x3f] = (uint8_t)(val >> (8 * i));  /* big-endian */
+}
+static const MemoryRegionOps frn_key_ops = {
+    .read = frn_key_read,
+    .write = frn_key_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -167,6 +239,9 @@ static uint8_t frn_p67[0x1000];
  * write handler clears 0x28-0x33. The parity advances on each poll so a busy
  * wait makes progress; good enough to drive the display pipeline for inspection.
  */
+/* FRN_P67_371A_DG diagnostic flag: set true while a 0x371a command txn is in flight
+ * (see the 0x30 read handler + the 0x0e command-write handler). */
+int frn_p67_371a_dg = 0;
 static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
 {
     /* FRN_P67BTN="off:val,off:val" : override p67 bytes on read (inject button
@@ -205,9 +280,37 @@ static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
          * FRN_P67_READY forces it back (to compare the old behavior). */
         static int ready = -1;
         if (ready < 0) ready = getenv("FRN_P67_READY") ? 0x8000 : 0;
-        uint16_t sync = (uint16_t)ready | (frame & 1);
+        /* 0x30 low bits = per-operation "complete" flags the firmware polls: bit0 (pump
+         * FUN_10448a08 &1), bit1 (poll FUN_10448a74 &2), etc. Toggle them together so each
+         * poll catches its bit within its iteration budget. bit15 stays clear (draw guard). */
+        /* bit5 (0x20) = DATA-PORT READY: FUN_104499ca pumps FUN_10448a08(_,0x20,500)
+         * before streaming a command's response block from the 0x20 data port. Without
+         * this the descriptor read (e.g. cmd 0x333a focal/lens descriptor -> screen+0x175,
+         * whose +0x176 nibble gates build_substep_focallen) times out and the focal
+         * picker build halts. Model the data port as always ready. */
+        uint16_t sync = (uint16_t)ready | 0x0020 | ((frame & 1) ? 0x0003 : 0x0000);
+        /* FRN_P67_371A_DG (diagnostic): assert the draw-guard bit15 while a 0x371a txn
+         * is in flight so build_hw_txn FUN_10447f3e returns 0 for the worker's path-select
+         * 0x371a(0) call -> menu_screen_build_worker takes PATH A (FUN_1044a516, no a2cc)
+         * instead of the a2cc/+0x176 dead-end PATH B. Tests whether path A completes. */
+        if (frn_p67_371a_dg) sync |= 0x8000;
         frn_p67[0x30] = sync >> 8;
         frn_p67[0x31] = sync & 0xff;
+    }
+    /* 0x67000020 = the body-control DATA PORT (FUN_1044ab58 = *(layout+8)+0x20): the firmware
+     * streams a per-command response block by reading this one register repeatedly (FUN_104499ca).
+     * Each query (cmd 0x63a etc.) expects DIFFERENT real device data here; a single fixed value
+     * satisfies one query's buffer check but breaks another's -> the response-DATA wall. So make
+     * it COMMAND-AWARE: return the value each query's check needs, keyed on the last cmd (0x0e).
+     * cmd 0x63a (sub-step6): buffer word needs bit 0x20000 set, bits24-27 != 0xf -> 0x00020000. */
+    if (off == 0x20 && size == 4) {
+        uint16_t lastcmd = ((uint16_t)frn_p67[0x0e] << 8) | frn_p67[0x0f];
+        if (lastcmd == 0x063a) return 0x00020000u;
+        /* cmd 0x333a (sub-step5 FUN_104485ce): streams the 8-byte focal/lens DESCRIPTOR
+         * into screen+0x175 via FUN_104499ca. Big-endian store puts word byte[23:16] at
+         * +0x176; build_substep_focallen gates on (*(screen+0x176) & 0xf): bit0 (bef0) or
+         * bit2 (bede). Return byte[1]=0x01 so the no-lens focal-picker build proceeds. */
+        if (lastcmd == 0x333a) return 0x00010000u;
     }
     uint64_t v = 0;
     for (unsigned i = 0; i < size; i++) {
@@ -217,8 +320,48 @@ static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
 }
 static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
+    { static int wl = -1; if (wl < 0) wl = getenv("FRN_LOG_P67") ? 1 : 0;
+      if (wl && off < 0x40) fprintf(stderr, "[p67wr] off 0x%03x sz%u = 0x%0*llx\n",
+          (unsigned)off, size, size*2, (unsigned long long)val); }
     for (unsigned i = 0; i < size; i++) {
         frn_p67[(off + size - 1 - i) & 0xfff] = (val >> (8 * i)) & 0xff;
+    }
+    /* p67 command/response: the rear-UI build issues HW query transactions via this
+     * block -- data -> 0x08, command -> 0x0e, response read back <- 0x10..0x1c (which
+     * the firmware copies to screen+0x3b4..). The real device, on a command write to
+     * 0x0e, produces a response ECHOING the 0x08 data (incl the 0xaa ping marker that
+     * build_hw_query/p67_query_check validate as (resp&0xff)==0xaa / bit7 set). Without
+     * this the response regs read 0 -> build sub-steps time out -> menu never builds. */
+    if (off <= 0x0e && off + size > 0x0e) {       /* a command was written to 0x0e */
+        /* Per-command response. The response word (0x10..0x13, big-endian) is checked
+         * differently per command, and byte[0] bit7 means OPPOSITE things:
+         *  - ping   0x802  : build_hw_query wants low byte (0x13) == 0xaa (marker echo).
+         *  - query  0x2902 : p67_query_check wants byte[0] bit7 SET ("valid data").
+         *  - status 0x700/0x71b : FUN_1044810e wants (resp & 0xfdf90008)==0 (no error bits;
+         *                 byte[0] bit7 is an ERROR flag here -> must be CLEAR).
+         * So branch on the command: ping -> echo the data; data-query -> valid+clean;
+         * everything else (status/control) -> clean (no error bits). */
+        uint16_t cmd = ((uint16_t)frn_p67[0x0e] << 8) | frn_p67[0x0f];
+        /* FRN_P67_371A_DG: mark a 0x371a txn in-flight so the 0x30 read asserts the
+         * draw-guard bit15 -> build_hw_txn returns 0 -> worker takes build PATH A. */
+        { static int dg = -1; if (dg < 0) dg = getenv("FRN_P67_371A_DG") ? 1 : 0;
+          if (dg) frn_p67_371a_dg = (cmd == 0x371a); }
+        if (cmd == 0x0802) {                 /* ping: echo the 0x08 data (0xaa marker) */
+            frn_p67[0x10] = frn_p67[0x08]; frn_p67[0x11] = frn_p67[0x09];
+            frn_p67[0x12] = frn_p67[0x0a]; frn_p67[0x13] = frn_p67[0x0b];
+        } else if (cmd == 0x2902) {          /* data query: byte[0] bit7 = valid */
+            frn_p67[0x10] = 0x80; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
+        } else if (cmd == 0x0102) {
+            /* body-mode/status query (path A FUN_10448640 -> screen+0x190, polled by
+             * FUN_1044a5a0 until byte[0] bit7 "ready" set; bits5,6 = 2-bit body mode).
+             * Return ready(bit7) so the poll completes. Mode bits in 5,6 selectable via
+             * FRN_P67_BODYMODE (0..3; default 0). NOT error-checked for this cmd. */
+            static int bm = -2; if (bm == -2) { const char *e = getenv("FRN_P67_BODYMODE"); bm = e ? atoi(e) : 0; }
+            uint8_t b0 = 0x80 | ((bm & 2) ? 0x40 : 0) | ((bm & 1) ? 0x20 : 0);
+            frn_p67[0x10] = b0; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
+        } else {                             /* status/control query: clean, no error bits */
+            frn_p67[0x10] = 0; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
+        }
     }
     frn_p67[0x24] = 0x01; frn_p67[0x25] = 0xf7;
     frn_p67[0x26] = 0x0f; frn_p67[0x27] = 0x00;
@@ -266,6 +409,72 @@ static void frn_wc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 static const MemoryRegionOps frn_wc_ops = {
     .read = frn_wc_read,
     .write = frn_wc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * OSDC MAIN status registers at 0x5c002000/10/20/30 (4 display channels). The
+ * frame-completion ISR osdc_main_isr_vec53 (FUN_1043ce50) posts the screen-render
+ * eventflags 0x2c-0x2f when (status & 0xc) == 0xc; flag 0x2d (Task23 screen_mgr's
+ * render flag at task23obj+0x1b4) comes from the 0x5c002010 channel. On real HW the
+ * OSDC sets these "frame ready" bits each VSYNC; the emulator must present them so
+ * the vec53 frame IRQ (autotimer, op_helper.c) causes the ISR to post. Firmware
+ * writes persist (control bits); reads of the 4 channel status words OR in 0xc.
+ * Pairs with the vec53 autotimer: together they are the modeled OSDC frame source.
+ */
+static uint8_t frn_osdc_mem[0x40];
+static uint64_t frn_osdc_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size; i++)
+        v = (v << 8) | frn_osdc_mem[(off + i) & 0x3f];   /* big-endian */
+    if (off == 0x00 || off == 0x10 || off == 0x20 || off == 0x30)
+        v |= 0x0cu;                                        /* frame-ready (bits 2,3) */
+    return v;
+}
+static void frn_osdc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    for (unsigned i = 0; i < size; i++)
+        frn_osdc_mem[(off + size - 1 - i) & 0x3f] = (uint8_t)(val >> (8 * i));
+}
+static const MemoryRegionOps frn_osdc_ops = {
+    .read = frn_osdc_read,
+    .write = frn_osdc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+
+/* 0x401c0000 SD card door / card detect controller.
+ * Status registers (0x106/0x126) always return 0x00 (door closed, no card). */
+static uint8_t frn_sdcard_mem[0x200];
+static uint64_t frn_sdcard_read(void *opaque, hwaddr off, unsigned size)
+{
+    /* Status registers always return 0x00 (door closed, no card) */
+    if ((off == 0x106 || off == 0x126) && size <= 2) {
+        return 0;
+    }
+    if (size == 1) return frn_sdcard_mem[off];
+    if (size == 2) return (frn_sdcard_mem[off] << 8) | frn_sdcard_mem[off+1];
+    if (size == 4) return (frn_sdcard_mem[off] << 24) | (frn_sdcard_mem[off+1] << 16) |
+                          (frn_sdcard_mem[off+2] << 8) | frn_sdcard_mem[off+3];
+    return 0;
+}
+static void frn_sdcard_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    if (size == 1) frn_sdcard_mem[off] = (uint8_t)val;
+    else if (size == 2) { frn_sdcard_mem[off] = (uint8_t)(val >> 8); frn_sdcard_mem[off+1] = (uint8_t)val; }
+    else if (size == 4) {
+        frn_sdcard_mem[off] = (uint8_t)(val >> 24); frn_sdcard_mem[off+1] = (uint8_t)(val >> 16);
+        frn_sdcard_mem[off+2] = (uint8_t)(val >> 8); frn_sdcard_mem[off+3] = (uint8_t)val;
+    }
+}
+static const MemoryRegionOps frn_sdcard_ops = {
+    .read = frn_sdcard_read,
+    .write = frn_sdcard_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -322,6 +531,14 @@ static void k10d_init(MachineState *machine)
     memory_region_init_io(wc, NULL, &frn_wc_ops, NULL, "frn.watchcnt", 0x10);
     memory_region_add_subregion_overlap(sysmem, 0x40090000, wc, 1);
 
+    /* 0x401c0000 peripheral (SD card door / card detect controller).
+     * Boot trace: fw writes 0x3 to 0x401c0104/0x401c0124, then reads 0x401c0106/0x401c0126.
+     * Status register (0x106/0x126) bits: bit0=card present?, bit1=door open?
+     * Return 0x00 (all clear) = door closed, no card = good boot state. */
+    MemoryRegion *sdcard = g_new(MemoryRegion, 1);
+    memory_region_init_io(sdcard, NULL, &frn_sdcard_ops, NULL, "frn.sdcard", 0x200);
+    memory_region_add_subregion_overlap(sysmem, 0x401c0000, sdcard, 1);
+
     /* ROM (firmware). Writable RAM-backed for bring-up simplicity. */
     memory_region_init_ram(rom, NULL, "k10d.rom", K10D_ROM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, K10D_ROM_BASE, rom);
@@ -346,6 +563,12 @@ static void k10d_init(MachineState *machine)
     MemoryRegion *blk5c = g_new(MemoryRegion, 1);
     memory_region_init_ram(blk5c, NULL, "k10d.blk5c", 0x00100000, &error_fatal);
     memory_region_add_subregion(sysmem, 0x5c000000, blk5c);
+    /* OSDC MAIN status device over 0x5c002000 (overlaps blk5c RAM at higher priority):
+     * presents the frame-ready status (bits 0xc) the vec53 ISR gates on, so the
+     * modeled OSDC frame IRQ posts the screen-render eventflags. */
+    MemoryRegion *osdc_st = g_new(MemoryRegion, 1);
+    memory_region_init_io(osdc_st, NULL, &frn_osdc_ops, NULL, "frn.osdc-status", 0x40);
+    memory_region_add_subregion_overlap(sysmem, 0x5c002000, osdc_st, 1);
     /* More dark regions the firmware uses (found via FRN_LOG_UNMAPPED, d308):
      * 0x50000000 written first in app-main (0x10439428, 3-channel controller);
      * 0x66000000 / 0x68000000 read by 0x1044b/0x104ab code. Back as RAM. */
@@ -370,8 +593,18 @@ static void k10d_init(MachineState *machine)
      * background keeps that poll passing (readback-0 there regresses app-main into an
      * infinite spin). Priority 0 sits below the 0x40090000 watch-counter overlay. */
     MemoryRegion *osdc = g_new(MemoryRegion, 1);
-    memory_region_init_ram(osdc, NULL, "k10d.osdc", 0x00070000, &error_fatal);
+    /* 0x00060000 (NOT 0x70000): stop before the 0x40060000 key/GPIO port so it is
+     * NOT shadowed by this RAM (RAM regions take a direct TLB path that bypasses the
+     * keyport overlay). 0x40060000+ then falls to frn_bg_read (all-ones idle + keypulse). */
+    memory_region_init_ram(osdc, NULL, "k10d.osdc", 0x00060000, &error_fatal);
     memory_region_add_subregion_overlap(sysmem, 0x40000000, osdc, 0);
+
+    /* Key/GPIO port device at 0x40060000: persists the key driver's RMW accumulator
+     * (frn_bg drops writes, which breaks key detection) + honors FRN_KEYPULSE. OSDC
+     * above is sized to 0x60000 so it does not overlap this. */
+    MemoryRegion *keyport = g_new(MemoryRegion, 1);
+    memory_region_init_io(keyport, NULL, &frn_key_ops, NULL, "frn.keyport", 0x40);
+    memory_region_add_subregion_overlap(sysmem, 0x40060000, keyport, 1);
 
     if (!machine->firmware) {
         error_report("k10d: supply the firmware with -bios FWDC162B.BIN");

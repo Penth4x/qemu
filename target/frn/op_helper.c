@@ -315,6 +315,11 @@ static void frn_snapshot(CPUFRNState *e)
         fprintf(stderr, "[frn] WRAM snapshot %d -> %s\n", idx, fn);
     }
     frn_hist_dump(path, idx);
+    /* FRN_HIST_RESET: fully zero the PC histogram after each snapshot dump so the
+     * NEXT snapshot's histogram is the delta since this one - isolates what a button
+     * press (injected between snapshots) actually causes, instead of boot noise. */
+    if (frn_hist_on && frn_hist && getenv("FRN_HIST_RESET"))
+        memset(frn_hist, 0, FRN_HIST_SZ * sizeof(uint32_t));
     frn_wrhist_dump(path, idx);
     frn_rdhist_dump(path, idx);
     idx++;
@@ -394,10 +399,93 @@ static int frn_force_lookup(uint32_t a, uint32_t *out)
     return 0;
 }
 
+/* --- Black-box DSP reply feeder (FRN_DSP_REPLY=hexbytes) ------------------
+ * The CPUCOM task sends a command over TDR(0x58) then waits for the DSP's reply.
+ * There is no DSP, so the reply never arrives (InSize=0 -> timeout). This models
+ * the DSP as a black box: after the firmware writes the command to TDR, offer the
+ * configured reply bytes on RDR(0x58) reads and assert RDRF in SSR(0x5e); fire
+ * vec26 (FRN_FIRE_VECS=26) to drive the RX ISR. Discover the reply the firmware
+ * accepts empirically by watching the cmd_handler transaction struct (FRN_DUMP_CMDH). */
+static uint8_t  frn_dsp_reply[64]; static int frn_dsp_reply_len = -1;
+static int      frn_dsp_pos = 0, frn_dsp_armed = 0;
+static int      frn_dsp_rdrf = 0x10;      /* candidate RDRF bit; override FRN_SCI_RDRF */
+static long     frn_dsp_feeds = 0, frn_dsp_maxfeeds = 0;
+static void frn_dsp_init(void)
+{
+    if (frn_dsp_reply_len >= 0) return;
+    frn_dsp_reply_len = 0;
+    const char *s = getenv("FRN_DSP_REPLY");
+    while (s && *s && frn_dsp_reply_len < 64) {
+        while (*s==' '||*s==',') s++;
+        if (!*s) break;
+        char buf[3]={0}; int n=0; while (n<2 && isxdigit((unsigned char)*s)) buf[n++]=*s++;
+        if (!n) break;
+        frn_dsp_reply[frn_dsp_reply_len++] = (uint8_t)strtoul(buf,NULL,16);
+    }
+    const char *r = getenv("FRN_SCI_RDRF"); if (r) frn_dsp_rdrf = (int)strtoul(r,NULL,16);
+    const char *m = getenv("FRN_DSP_MAXFEEDS"); frn_dsp_maxfeeds = m ? strtol(m,NULL,0) : 2000;
+}
+/* --- Black-box DSP: CPUCOM SPI/CSIO at 0x5c004040(status)/0x5c004043(data) ----
+ * The Cmd:04 handshake is a full-duplex SPI transfer (cpucom_spi_xfer 0x10465958):
+ * firmware writes a TX byte to the data reg then reads the simultaneous RX byte;
+ * the status reg bit10(0x400)=BUSY is polled until clear. The regs are in the
+ * 0x5c block (RAM-backed -> read 0 -> all-zero reply -> validation times out). This
+ * models the DSP: never-busy status, and a per-byte response stream. The firmware
+ * sends [Cmd][Size][data...] and reads [resp0][InSize][data...]; discover the reply
+ * that makes the transfer validate (result 0) empirically via FRN_SPI_REPLY. */
+#define SPI_STATUS 0x5c004040u
+#define SPI_DATA   0x5c004043u
+static uint8_t frn_spi_reply[64]; static int frn_spi_reply_len = -1;
+static int frn_spi_pos = 0; static int frn_spi_on = 0;
+static int frn_spi_busy = 0;   /* pulses 1 after a start, cleared on next status read */
+static uint8_t frn_hs_reqprev = 0, frn_hs_pendack = 0;  /* 0x50000106 handshake: req edges -> ack pulse */
+static void frn_spi_init(void)
+{
+    if (frn_spi_reply_len >= 0) return;
+    frn_spi_reply_len = 0;
+    const char *s = getenv("FRN_SPI_REPLY");
+    /* The DSP/companion chip is ALWAYS physically present on the camera, so its
+     * CPUCOM reply is permanent model behavior — not opt-in. Default ON (opt out
+     * with FRN_NO_DSP for A/B testing). FRN_SPI_REPLY still overrides the reply
+     * bytes. Without it, default to a single 0x01 ack (the known-good handshake
+     * value) so the Cmd:04 transfer returns In Size:5 and POST passes. */
+    frn_spi_on = (getenv("FRN_NO_DSP") == NULL);
+    while (s && *s && frn_spi_reply_len < 64) {
+        while (*s==' '||*s==',') s++;
+        if (!*s) break;
+        char buf[3]={0}; int n=0; while (n<2 && isxdigit((unsigned char)*s)) buf[n++]=*s++;
+        if (!n) break;
+        frn_spi_reply[frn_spi_reply_len++] = (uint8_t)strtoul(buf,NULL,16);
+    }
+    if (frn_spi_reply_len == 0) { frn_spi_reply[0] = 0x01; frn_spi_reply_len = 1; }
+}
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
     frn_rd_hist(a);
     frn_rd_watch(e, a);
+    /* Black-box DSP GPIO handshake at 0x50000106: the firmware sets bit 0x40 ("byte
+     * ready" req to DSP) and polls bit 0x01 ("DSP ready" ack). Model the DSP acking:
+     * bit 0x01 mirrors bit 0x40 (ack follows req), so the per-byte handshake proceeds. */
+    /* dev2 (settings EEPROM/serial on 0x5c005000) status: bit0x01=ready. RAM-backed ->
+     * never sets -> firmware spins (FUN_1043fd24). Report ready so transfers proceed. */
+    if (a == 0x5c005000u) { frn_spi_init();
+        if (frn_spi_on) return cpu_ldub_data(e, a) | 0x01u; }
+    if (a == 0x50000106u) { frn_spi_init();
+        if (frn_spi_on) { uint32_t b = cpu_ldub_data(e, a);
+            /* DSP handshake (code-derived): main drives req bits 0x20/0x40/0x80 and the
+             * cycle is req-up -> wait ack CLEAR, req-down -> wait ack SET. So the DSP ack
+             * (0x01/0x02/0x04) is the INVERSE of the matching req (0x20/0x40/0x80): ack
+             * asserts when the main releases req. ack = (~req) >> 5. */
+            return (b & 0xf8u) | (((~b) >> 5) & 0x07u); } }
+    if (a == SPI_DATA) { frn_spi_init();
+        if (frn_spi_on) {
+            uint8_t b = (frn_spi_pos < frn_spi_reply_len) ? frn_spi_reply[frn_spi_pos] : 0xff;
+            if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
+                "[spi] RX byte[%d]=0x%02x pc=0x%08x\n", frn_spi_pos, b, e->pc);
+            frn_spi_pos++;
+            return b;
+        }
+    }
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xff; }
     if (a == 0x4A) return (e->tmr_count >> 8) & 0xff;
     if (a == 0x4B) return e->tmr_count & 0xff;
@@ -459,6 +547,14 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
         e->dicr_pending = v & 1;
     } else if (a >= 0x48 && a <= 0x4F) {
         frn_timer_reg_written(e);
+    } else if (a == 0x50000106u) {
+        /* DSP handshake: a req bit (0x20/0x40/0x80) rising schedules one ack pulse
+         * (req>>5) that the next read of this reg will deliver then consume. */
+        frn_spi_init();
+        if (frn_spi_on) { uint8_t nv = v & 0xff;
+            uint8_t rising = (uint8_t)(nv & 0xe0) & (uint8_t)~frn_hs_reqprev;
+            frn_hs_pendack |= (uint8_t)((rising >> 5) & 0x07u);
+            frn_hs_reqprev = nv & 0xe0; }
     } else if (a == 0x61) {
         /* Debug UART TX data reg: capture the firmware's serial output so boot
          * progress / debug banners are visible. Gated by FRN_UART (default on). */
@@ -472,6 +568,28 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xffff; }
+    /* CPUCOM (main<->DSP) SCI status reg at 0x5e: bit2 (0x0004) = TX-complete. The
+     * send loop (cpucom_sci_send_byte 0x1043c186) busy-waits while((st & 4)==0);
+     * 0x5e is RAM so bit2 never sets -> spin. Report TX-complete so the send
+     * progresses and the DSP handshake can proceed. Gated by FRN_DSP_OFF to disable. */
+    if (a == SPI_STATUS) { frn_spi_init();
+        uint32_t r = cpu_lduw_be_data(e, a);
+        if (frn_spi_on) r &= ~0x0400u;   /* black-box DSP: transfer completes instantly (busy clear) */
+        return r; }
+    if (a == 0x5e) { static int off = -1; if (off < 0) off = getenv("FRN_DSP_OFF") ? 1 : 0;
+        frn_dsp_init();
+        uint32_t r = cpu_lduw_be_data(e, a); if (!off) r |= 0x0004;
+        /* assert RDRF while a black-box reply byte is pending */
+        if (frn_dsp_armed && frn_dsp_pos < frn_dsp_reply_len) r |= frn_dsp_rdrf;
+        return r; }
+    /* RDR(0x58) read: hand the next black-box reply byte to the firmware's RX reader */
+    if (a == 0x58) { frn_dsp_init();
+        if (frn_dsp_armed && frn_dsp_pos < frn_dsp_reply_len) {
+            uint32_t b = frn_dsp_reply[frn_dsp_pos++]; frn_dsp_feeds++;
+            if (frn_dsp_pos >= frn_dsp_reply_len) frn_dsp_armed = 0;
+            if (getenv("FRN_DSP_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
+                "[dsp-reply] RDR read -> byte 0x%02x (%d/%d) pc=0x%08x\n", b, frn_dsp_pos, frn_dsp_reply_len, e->pc);
+            return b; } }
     { uint32_t r = cpu_lduw_be_data(e, a); frn_rbw_check(e, a, 2, r); return r; }
 }
 static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
@@ -487,6 +605,20 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     if (a < 0x50) { wr8(e, a, v >> 8); wr8(e, a + 1, v); return; }
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
+    /* CPUCOM SPI black-box: status write with config bit 0x200 = a new transaction
+     * is being set up -> reset the per-byte response position. */
+    if (a == SPI_STATUS) { frn_spi_init(); if (frn_spi_on) {
+        if (v & 0x200) { if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
+                "[spi] txn start (status<-0x%04x) reset pos\n", v & 0xffff);
+            frn_spi_pos = 0; }
+        if (v & 0x100) frn_spi_busy = 1;   /* bit8 start -> transfer in progress */
+    } }
+    /* DSP black-box: the firmware just wrote a byte to TDR(0x58) = sent a command
+     * byte. Arm the reply (reset position) so the configured reply is offered on
+     * the subsequent RDR reads once the firmware enters its receive state. */
+    if (a == 0x58) { frn_dsp_init();
+        if (frn_dsp_reply_len > 0 && (frn_dsp_maxfeeds==0 || frn_dsp_feeds < frn_dsp_maxfeeds)) {
+            frn_dsp_armed = 1; frn_dsp_pos = 0; } }
 }
 uint64_t frn_lcd_writes;      /* debug: count of LCD-reg writes */
 uint32_t frn_lcd_scanout;     /* debug: scanout base once programmed */
@@ -722,8 +854,13 @@ static void frn_fire_tick(CPUFRNState *e)
  * is the peripheral IMPLEMENTATION (always on), distinct from the FRN_FIRE_VECS
  * debug knob. Disable with FRN_NO_AUTOTIMER; retune with FRN_AUTOTIMER_PERIOD.
  * vec41 stays handled by frn_watch_tick. */
-#define FRN_AUTOTIMER_N 4
-static const uint32_t frn_autotimer_vec[FRN_AUTOTIMER_N] = { 43, 48, 49, 50 };
+/* vec56 = OSDC SUB display IRQ (armed by firmware but never raised = no HW source
+ * in emu). Its ISR (0x1043ce50) reads OSDC status 0x5c002000/10/20/30 (bits 0xc =
+ * frame ready, modeled in k10d.c) and dispatches OSDC events 0x2c-0x2f; event 0x2d
+ * sets Task23's render eventflag 0x804a976c. vec53 (OSDC MAIN) is NOT armed in this
+ * boot (autotimer skips masked ICRs); vec56 is the live display IRQ. */
+#define FRN_AUTOTIMER_N 6
+static const uint32_t frn_autotimer_vec[FRN_AUTOTIMER_N] = { 43, 48, 49, 50, 53, 56 };
 static uint32_t frn_autotimer_div[FRN_AUTOTIMER_N];
 static uint8_t  frn_autotimer_pending[FRN_AUTOTIMER_N];
 static long frn_autotimer_period = 200000;
@@ -832,7 +969,9 @@ static void frn_wake_inject(CPUFRNState *e)
         next_fire = delay;
     }
     if ((!flagobj && flagid < 0 && call_fn < 0) || done) return;
-    if (e->pc != FRN_IDLE_PC) return;       /* only from the settled idle task */
+    { static uint32_t idle_pc = 0; if (!idle_pc) { const char *ip = getenv("FRN_IDLE_PC");
+        idle_pc = ip ? (uint32_t)strtoul(ip, NULL, 16) : FRN_IDLE_PC; }
+      if (e->pc != idle_pc) return; }       /* only from the settled idle task (FRN_IDLE_PC overridable) */
     if (cnt++ < next_fire) return;          /* wait until the next scheduled fire */
     /* schedule next fire: periodic (if period>0 and under maxfires) else one-shot */
     if (call_fn2 > 0 && fires == 0) next_fire = cnt + gap2;   /* schedule the 2nd sequential call */
@@ -888,7 +1027,12 @@ static void frn_poke_tick(CPUFRNState *e)
         next=delay;
     }
     if (n==0) return;
-    if (e->pc != 0x10491512u) return;
+    static int anypc = -1; if (anypc < 0) anypc = getenv("FRN_POKE_ANYPC") ? 1 : 0;
+    if (!anypc) {
+        static uint32_t poke_pc = 0; if (!poke_pc) { const char *ip=getenv("FRN_IDLE_PC");
+            poke_pc = ip ? (uint32_t)strtoul(ip,NULL,16) : 0x1000f530u; }  /* real idle = bra-self 0x1000f530 */
+        if (e->pc != poke_pc) return;
+    }  /* FRN_POKE_ANYPC: fire by instruction-boundary count (FRN_POKE_AT), not gated on a specific PC */
     if (cnt++ < next) return;
     if (period>0 && (maxf==0 || fires+1<maxf)) next=cnt+period; else next=0x7fffffffffffffffL;
     fires++;
@@ -1027,6 +1171,78 @@ void HELPER(frn_interp)(CPUFRNState *env)
                 c_disp, c_vis, c_mark, c_draw);
         }
       } }
+    /* FRN_DUMP_CMDH: at cpucom cmd_handler 0x10430554, dump the transaction struct
+     * at r9 (fields per error_print: +0=OutCode,+4=InCmd,+8=InSize,+0xc=OutCmd,
+     * +0x10=OutSize) so a PASSING txn (code 0x10003) can be compared to the failing
+     * Cmd:04 - revealing exactly which field the black-box DSP must supply. */
+    if (pc == 0x10430554u && getenv("FRN_DUMP_CMDH")) {
+        uint32_t s = env->regs[9];
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+            "[cmdh] r5(code)=0x%08x r9=0x%08x  struct: OutCode=0x%08x InCmd=0x%02x InSize=0x%08x OutCmd=0x%02x OutSize=0x%08x\n",
+            env->regs[5], s, cpu_ldl_be_data(env, s), cpu_ldub_data(env, s+4),
+            cpu_ldl_be_data(env, s+8), cpu_ldub_data(env, s+0xc), cpu_ldl_be_data(env, s+0x10));
+    }
+    /* FRN_DUMP_SPI: at cpucom_spi_xfer 0x10465958 entry, dump the LIVE txn (r4) flag
+     * objects so the exact completion-flag memory bit (addr+mask) is known. flag obj
+     * layout: +0x10 = byte* to the flag memory, +0x1c = mask byte. */
+    if (pc == 0x10465958u && getenv("FRN_DUMP_SPI")) {
+        uint32_t t = env->regs[4];
+        uint32_t fa = cpu_ldl_be_data(env, t+0x10), fb = cpu_ldl_be_data(env, t+0x14);
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+            "[spixfer] txn=0x%08x flagA(+0x10)=0x%08x[addr=0x%08x mask=0x%02x] flagB(+0x14)=0x%08x[addr=0x%08x mask=0x%02x] ch=0x%08x\n",
+            t, fa, fa?cpu_ldl_be_data(env,fa+0x10):0, fa?cpu_ldub_data(env,fa+0x1c):0,
+            fb, fb?cpu_ldl_be_data(env,fb+0x10):0, fb?cpu_ldub_data(env,fb+0x1c):0,
+            cpu_ldl_be_data(env, t+0xc));
+    }
+    /* FRN_DUMP_FLAG: at the per-byte DSP-ready waiter FUN_10465f24 (0x10465f24),
+     * dump the flag object it polls (*(txn+0x14)): active(+0x10c), byte-addr(+0x10),
+     * mask(+0x1c), and the live byte value - so the handshake flag is known exactly. */
+    if (pc == 0x10465f24u && getenv("FRN_DUMP_FLAG")) {
+        uint32_t t = env->regs[4];
+        uint32_t fb = cpu_ldl_be_data(env, t+0x14);
+        uint32_t active = fb?cpu_ldl_be_data(env, fb+0x10c):0;
+        uint32_t ba = fb?cpu_ldl_be_data(env, fb+0x10):0;
+        uint32_t mask = fb?cpu_ldub_data(env, fb+0x1c):0;
+        uint32_t val = ba?cpu_ldub_data(env, ba):0;
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+            "[flag] txn=0x%08x flagB=0x%08x active(+0x10c)=0x%08x byteaddr(+0x10)=0x%08x mask=0x%02x val@addr=0x%02x\n",
+            t, fb, active, ba, mask, val);
+    }
+    /* FRN_DUMP_TF: at test_flag_clear/set (0x104398ac/0x104398c0), log the EXACT
+     * dereference the firmware does - obj(r4), the byte-pointer *(obj+0x10), the
+     * mask *(obj+0x1c), and the live byte - so the handshake flag's real binding is
+     * ground-truth (no hand offset math). */
+    /* FRN_DUMP_DEV2: at dev2 ready-poll FUN_1043fd24 (0x1043fd24), log its status-reg
+     * addr *(obj+0x1c), the live byte, and data-reg addr *(obj+0x34) - the device the
+     * firmware spins on after CPUCOM POST (looks like a settings EEPROM: cmd 0xe0/0x65 + 16B read). */
+    if (pc == 0x1043fd24u && getenv("FRN_DUMP_DEV2")) {
+        static int n; if (n++ < 6) { uint32_t o = env->regs[4];
+            uint32_t sa = cpu_ldl_be_data(env, o+0x1c), da = cpu_ldl_be_data(env, o+0x34);
+            fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[dev2] obj=0x%08x statusreg=0x%08x byte=0x%02x datareg=0x%08x\n",
+                o, sa, (sa>=0x40&&sa<0x90000000u)?cpu_ldub_data(env,sa):0xff, da); }
+    }
+    /* FRN_DUMP_FLG: log set_flag(0x1043986a)/clear_flag(0x10439822) that target
+     * 0x50000106 - the main's req bit (addr+mask), to pair with the poller's ack bit. */
+    if ((pc == 0x1043986au || pc == 0x10439822u) && getenv("FRN_DUMP_FLG")) {
+        uint32_t o = env->regs[4];
+        uint32_t ad = cpu_ldl_be_data(env, o+0x10), mk = cpu_ldub_data(env, o+0x1c);
+        if (ad == 0x50000106u) { static int n; if (n++ < 20)
+            fprintf(frn_tr_out ? frn_tr_out : stderr, "[flg] %s addr=0x%08x mask=0x%02x\n",
+                pc==0x1043986au?"SET  ":"CLEAR", ad, mk); }
+    }
+    if ((pc == 0x104398acu || pc == 0x104398c0u) && getenv("FRN_DUMP_TF")) {
+        static int nn; if (nn++ < 60) {
+            uint32_t o = env->regs[4];
+            uint32_t bp = cpu_ldl_be_data(env, o+0x10);
+            uint32_t mask = cpu_ldub_data(env, o+0x1c);
+            uint32_t val = (bp>=0x40 && bp<0x90000000u) ? cpu_ldub_data(env, bp) : 0xdead;
+            fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[tf] %s obj=0x%08x byteptr=0x%08x mask=0x%02x byte=0x%02x -> %s\n",
+                pc==0x104398c0u?"SET ":"CLR ", o, bp, mask, val,
+                (val!=0xdead && (val&mask))?"bit-SET":"bit-clear");
+        }
+    }
     if (frn_tr_watch_n && frn_tr_watched(pc)) {
         static long minr6 = -1;
         if (minr6 < 0) {
@@ -1041,8 +1257,8 @@ void HELPER(frn_interp)(CPUFRNState *env)
         if ((long)r[6] >= minr6 && (maxhits == 0 || hits < maxhits)) {
             hits++;
             fprintf(frn_tr_out, "[call] 0x%08x  r4=0x%08x r5=0x%08x r6=0x%08x "
-                    "r7=0x%08x r8=0x%08x r13=0x%08x r14=0x%08x  rp=0x%08x sp=0x%08x\n",
-                    pc, r[4], r[5], r[6], r[7], r[8], r[13], r[14], env->rp, r[15]);
+                    "r7=0x%08x r8=0x%08x r9=0x%08x r13=0x%08x r14=0x%08x  rp=0x%08x sp=0x%08x\n",
+                    pc, r[4], r[5], r[6], r[7], r[8], r[9], r[13], r[14], env->rp, r[15]);
             /* walk the stack for firmware-range return addresses = call chain */
             fprintf(frn_tr_out, "       stack:");
             for (int k = 0; k < 96; k++) {
@@ -1264,6 +1480,54 @@ void HELPER(frn_interp)(CPUFRNState *env)
                 _seen[_ns++] = svc;
                 fprintf(frn_tr_out ? frn_tr_out : stderr, "[int40] service r12=%08x  r4=%08x r5=%08x  pc=%08x  vec=%08x\n",
                         svc, env->regs[4], env->regs[5], pc, rd32(env, env->tbr + 0x3FC - (td * 4)));
+            }
+            /* FRN_INT40_SVC=hex (comma list): log EVERY call to those REALOS services
+             * with full args r4-r7 + rp = map a specific transaction (e.g. CPUCOM
+             * snd_dtq/rcv_dtq). FRN_INT40_SVC=all logs all. */
+            static long _if_init; static uint32_t _if[16]; static int _ifn; static int _ifall;
+            if (!_if_init) { _if_init = 1; const char *s = getenv("FRN_INT40_SVC");
+                if (s && (!strcmp(s,"all")||!strcmp(s,"ALL"))) _ifall = 1;
+                while (s && *s && !_ifall && _ifn < 16) { char *e2; unsigned long v = strtoul(s,&e2,16);
+                    if (e2==s) break; _if[_ifn++] = (uint32_t)v; s = (*e2==',')?e2+1:e2; } }
+            int hit = _ifall;
+            for (int k = 0; k < _ifn && !hit; k++) if (_if[k] == svc) hit = 1;
+            if (hit) fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[int40*] r12=%08x r4=%08x r5=%08x r6=%08x r7=%08x  pc=%08x rp=%08x\n",
+                svc, env->regs[4], env->regs[5], env->regs[6], env->regs[7], pc, env->rp);
+        }
+        /* FRN_CPUCOM_ACK=<code hex>: EXPERIMENT. The CPUCOM task blocks in
+         * rcv_mbx(id=4, TMO_FEVR) forever (no DSP posts to mailbox 4). When that
+         * exact call happens, synthesize a success message instead of letting the
+         * kernel primitive block: write msg{+0=next,+4=cmd,+8=code} to scratch,
+         * set *r5=msgptr and ercd(r4)=0, and skip the real primitive. Observe
+         * whether the firmware then advances to producing menu content. Gated on
+         * the forever-timeout so normal polling receives are untouched. */
+        if (td == 0x40 && env->regs[12] == 0x100111b0u) {
+            static long ck_init = 0; static uint32_t ck_code = 0; static int ck_mbx = 4;
+            static long ck_max = 0, ck_n = 0;
+            if (!ck_init) { ck_init = 1;
+                const char *c = getenv("FRN_CPUCOM_ACK"); if (c) ck_code = (uint32_t)strtoul(c, NULL, 16);
+                const char *m = getenv("FRN_CPUCOM_ACK_MBX"); if (m) ck_mbx = (int)strtol(m, NULL, 0);
+                const char *x = getenv("FRN_CPUCOM_ACK_N"); ck_max = x ? strtol(x, NULL, 0) : 32; }
+            if (ck_code && env->regs[4] == (uint32_t)ck_mbx &&
+                env->regs[6] == 0xffffffffu && (ck_max == 0 || ck_n < ck_max)) {
+                uint32_t msg = 0x8ff00200u + (uint32_t)((ck_n & 7) * 0x40);
+                wr32(env, msg + 0, 0);            /* next ptr */
+                wr32(env, msg + 4, 0x04);         /* cmd */
+                /* code field at +8 is read byte-wise and reassembled LITTLE-endian
+                 * by 0x104598e8, so store it byte-swapped vs the BE wr32. */
+                wr32(env, msg + 8, __builtin_bswap32(ck_code));  /* response Code (LE) */
+                wr32(env, msg + 0xc, 0);
+                wr32(env, msg + 0x10, 0);
+                wr32(env, env->regs[5], msg);     /* *param_2 = msgptr */
+                env->regs[4] = 0;                 /* ercd = E_OK */
+                if (frn_tr_irq || getenv("FRN_CPUCOM_ACK_LOG"))
+                    fprintf(frn_tr_out ? frn_tr_out : stderr,
+                        "[cpucom-ack #%ld] rcv_mbx(%d) -> synth msg 0x%08x code=0x%08x  pc=%08x\n",
+                        ck_n, ck_mbx, msg, ck_code, pc);
+                ck_n++;
+                env->pc = pc + 2;                 /* skip the real primitive */
+                break;
             }
         }
         uint32_t ea = env->tbr + 0x3FC - (td * 4);
