@@ -459,8 +459,42 @@ static void frn_spi_init(void)
     }
     if (frn_spi_reply_len == 0) { frn_spi_reply[0] = 0x01; frn_spi_reply_len = 1; }
 }
+
+/* --- Full execution + memory trace (FRN_FT) --------------------------------
+ * Windowed by instruction count so volume stays sane. Set:
+ *   FRN_FT=path          output file (default stderr)
+ *   FRN_FT_FROM=<n> FRN_FT_TO=<n>   log only instructions [from,to] (raw count)
+ *   FRN_FT_PC=<hex>      alternative: start logging when PC first reaches this,
+ *                        for FRN_FT_WIN instructions (default 200000)
+ * Emits one line per instruction: "<ic> PC=0x.. r4=.. r5=.. r13=..", and per
+ * memory access within the window: "  R/W sz@0x.. =0x..". This is the full path +
+ * RAM/MMIO access log to pinpoint exactly where boot diverges. */
+static long     frn_ic = 0;              /* global instruction counter */
+static int      frn_ft_on = -1, frn_ft_active = 0;
+static long     frn_ft_from = 0, frn_ft_to = 0, frn_ft_win = 200000, frn_ft_pcstart = 0, frn_ft_started = 0;
+static FILE    *frn_ft_fp = NULL;
+static void frn_ft_init(void)
+{
+    if (frn_ft_on >= 0) return;
+    const char *s = getenv("FRN_FT");
+    frn_ft_on = (s != NULL);
+    if (!frn_ft_on) return;
+    frn_ft_fp = (s[0] && strcmp(s,"1")) ? fopen(s, "w") : NULL;
+    if (!frn_ft_fp) frn_ft_fp = stderr;
+    const char *a = getenv("FRN_FT_FROM"); if (a) frn_ft_from = strtol(a, NULL, 0);
+    const char *b = getenv("FRN_FT_TO");   if (b) frn_ft_to   = strtol(b, NULL, 0);
+    const char *p = getenv("FRN_FT_PC");   if (p) frn_ft_pcstart = strtoul(p, NULL, 16);
+    const char *w = getenv("FRN_FT_WIN");  if (w) frn_ft_win = strtol(w, NULL, 0);
+}
+static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
+{
+    if (!frn_ft_active) return;
+    if (kind == 'W') fprintf(frn_ft_fp, "  W%d @0x%08x =0x%08x\n", sz, a, v);
+    else             fprintf(frn_ft_fp, "  R%d @0x%08x\n", sz, a);
+}
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
+    frn_ft_mem('R', a, 0, 1);
     frn_rd_hist(a);
     frn_rd_watch(e, a);
     /* Black-box DSP GPIO handshake at 0x50000106: the firmware sets bit 0x40 ("byte
@@ -540,6 +574,7 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
 
 static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 {
+    frn_ft_mem('W', a, v, 1);
     frn_wr_hist(a);
     frn_wr_watch(e, a, v);
     cpu_stb_data(e, a, v & 0xff); frn_rbw_mark(a, 1);
@@ -566,6 +601,7 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
+    frn_ft_mem('R', a, 0, 2);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xffff; }
     /* CPUCOM (main<->DSP) SCI status reg at 0x5e: bit2 (0x0004) = TX-complete. The
@@ -596,6 +632,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
+    frn_ft_mem('R', a, 0, 4);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv; }
     { uint32_t r = cpu_ldl_be_data(e, a); frn_rbw_check(e, a, 4, r); return r; }
@@ -603,6 +640,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 8); wr8(e, a + 1, v); return; }
+    frn_ft_mem('W', a, v, 2);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
     /* CPUCOM SPI black-box: status write with config bit 0x200 = a new transaction
@@ -626,6 +664,7 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if (a < 0x50) { wr8(e, a, v >> 24); wr8(e, a + 1, v >> 16);
                     wr8(e, a + 2, v >> 8); wr8(e, a + 3, v); return; }
+    frn_ft_mem('W', a, v, 4);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     if (a >= 0x40100000 && a < 0x40101000) {
         frn_lcd_writes++;
@@ -1063,6 +1102,20 @@ void HELPER(frn_interp)(CPUFRNState *env)
     frn_snapshot(env);
     uint32_t pc = env->pc;
     frn_hist_tick(pc);
+    /* Full execution + memory trace (windowed). */
+    frn_ft_init();
+    if (frn_ft_on) {
+        frn_ic++;
+        if (frn_ft_pcstart && !frn_ft_started && pc == frn_ft_pcstart) {
+            frn_ft_started = 1; frn_ft_from = frn_ic; frn_ft_to = frn_ic + frn_ft_win;
+        }
+        frn_ft_active = (frn_ic >= frn_ft_from &&
+                         (frn_ft_to == 0 || frn_ic <= frn_ft_to) &&
+                         (!frn_ft_pcstart || frn_ft_started));
+        if (frn_ft_active)
+            fprintf(frn_ft_fp, "%ld PC=0x%08x r4=%08x r5=%08x r8=%08x r13=%08x\n",
+                    frn_ic, pc, r[4], r[5], r[8], r[13]);
+    }
     /* FRN_LOG_USER: holistic handover map — log every transition of the live S-flag
      * (env->sf): 0->1 = entry to USER mode (userland handover), 1->0 = back to system.
      * If sf never becomes 1, the kernel never hands any task to userland (the root). */
