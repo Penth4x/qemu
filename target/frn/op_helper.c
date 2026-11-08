@@ -438,6 +438,19 @@ static void frn_dsp_init(void)
 static uint8_t frn_spi_reply[64]; static int frn_spi_reply_len = -1;
 static int frn_spi_pos = 0; static int frn_spi_on = 0;
 static int frn_spi_busy = 0;   /* pulses 1 after a start, cleared on next status read */
+/* TX capture: the firmware writes [Cmd][OutSize][data...] to SPI_DATA. Record it so
+ * the reply can be selected PER-COMMAND (the DSP answers Cmd:01 differently from
+ * Cmd:04). frn_spi_tx[0]=Cmd, [1]=OutSize, [2..]=data. Reset on txn start. */
+static uint8_t frn_spi_tx[64]; static int frn_spi_txlen = 0;
+/* Per-command reply for Cmd:01 (the periodic DSP status poll). The full-duplex RX
+ * stream is [ack][in-size][payload...]. The flat default stub returns ack=0x01 then
+ * 0xff fill -> in-size reads 0xff -> firmware clamps it to 0 (sentinel) -> empty
+ * payload -> the type-1 response handler never gets DSP status -> the poll repeats
+ * forever and boot never advances past DSP init. So Cmd:01 MUST get a real in-size
+ * (!=0xff) plus that many real payload bytes. Values are handler-defined (RAM vtable,
+ * not statically known) -> probe via FRN_SPI_R01 (hex bytes, full RX stream incl. the
+ * leading ack + in-size). Default: ack=01, in-size=04, payload a1 a2 a3 a4 (probe). */
+static uint8_t frn_spi_r01[64]; static int frn_spi_r01_len = -1;
 static uint8_t frn_hs_reqprev = 0, frn_hs_pendack = 0;  /* 0x50000106 handshake: req edges -> ack pulse */
 static void frn_spi_init(void)
 {
@@ -458,6 +471,20 @@ static void frn_spi_init(void)
         frn_spi_reply[frn_spi_reply_len++] = (uint8_t)strtoul(buf,NULL,16);
     }
     if (frn_spi_reply_len == 0) { frn_spi_reply[0] = 0x01; frn_spi_reply_len = 1; }
+    /* Cmd:01 per-command reply (full RX stream): FRN_SPI_R01, else default probe. */
+    frn_spi_r01_len = 0;
+    const char *s1 = getenv("FRN_SPI_R01");
+    while (s1 && *s1 && frn_spi_r01_len < 64) {
+        while (*s1==' '||*s1==',') s1++;
+        if (!*s1) break;
+        char buf[3]={0}; int n=0; while (n<2 && isxdigit((unsigned char)*s1)) buf[n++]=*s1++;
+        if (!n) break;
+        frn_spi_r01[frn_spi_r01_len++] = (uint8_t)strtoul(buf,NULL,16);
+    }
+    if (frn_spi_r01_len == 0) {
+        static const uint8_t def01[] = { 0x01, 0x04, 0xa1, 0xa2, 0xa3, 0xa4 };
+        memcpy(frn_spi_r01, def01, sizeof def01); frn_spi_r01_len = sizeof def01;
+    }
 }
 
 /* --- Full execution + memory trace (FRN_FT) --------------------------------
@@ -513,9 +540,19 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
             return (b & 0xf8u) | (((~b) >> 5) & 0x07u); } }
     if (a == SPI_DATA) { frn_spi_init();
         if (frn_spi_on) {
-            uint8_t b = (frn_spi_pos < frn_spi_reply_len) ? frn_spi_reply[frn_spi_pos] : 0xff;
+            /* Select the reply by the captured command byte (frn_spi_tx[0]). Cmd:01 is
+             * the periodic status poll and needs a real in-size + payload; everything
+             * else keeps the flat default (ack 0x01 then 0xff), which the tolerant
+             * Cmd:04 POST accepts. */
+            uint8_t b;
+            uint8_t cmd = (frn_spi_txlen > 0) ? frn_spi_tx[0] : 0xff;
+            if (cmd == 0x01) {
+                b = (frn_spi_pos < frn_spi_r01_len) ? frn_spi_r01[frn_spi_pos] : 0xff;
+            } else {
+                b = (frn_spi_pos < frn_spi_reply_len) ? frn_spi_reply[frn_spi_pos] : 0xff;
+            }
             if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
-                "[spi] RX byte[%d]=0x%02x pc=0x%08x\n", frn_spi_pos, b, e->pc);
+                "[spi] RX byte[%d]=0x%02x (cmd=0x%02x) pc=0x%08x\n", frn_spi_pos, b, cmd, e->pc);
             frn_spi_pos++;
             return b;
         }
@@ -590,6 +627,15 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
             uint8_t rising = (uint8_t)(nv & 0xe0) & (uint8_t)~frn_hs_reqprev;
             frn_hs_pendack |= (uint8_t)((rising >> 5) & 0x07u);
             frn_hs_reqprev = nv & 0xe0; }
+    } else if (a == SPI_DATA) {
+        /* CPUCOM TX byte: record it so the per-command responder can see which
+         * command the firmware is sending. [0]=Cmd, [1]=OutSize, [2..]=data. */
+        frn_spi_init();
+        if (frn_spi_on && frn_spi_txlen < (int)sizeof frn_spi_tx) {
+            frn_spi_tx[frn_spi_txlen++] = v & 0xff;
+            if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out ? frn_tr_out : stderr,
+                "[spi] TX byte[%d]=0x%02x pc=0x%08x\n", frn_spi_txlen - 1, v & 0xff, e->pc);
+        }
     } else if (a == 0x61) {
         /* Debug UART TX data reg: capture the firmware's serial output so boot
          * progress / debug banners are visible. Gated by FRN_UART (default on). */
@@ -648,7 +694,7 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     if (a == SPI_STATUS) { frn_spi_init(); if (frn_spi_on) {
         if (v & 0x200) { if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
                 "[spi] txn start (status<-0x%04x) reset pos\n", v & 0xffff);
-            frn_spi_pos = 0; }
+            frn_spi_pos = 0; frn_spi_txlen = 0; }
         if (v & 0x100) frn_spi_busy = 1;   /* bit8 start -> transfer in progress */
     } }
     /* DSP black-box: the firmware just wrote a byte to TDR(0x58) = sent a command
