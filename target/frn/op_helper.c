@@ -678,10 +678,13 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
-    frn_ft_mem('R', a, 0, 4);
     frn_rd_hist(a); frn_rd_watch(e, a);
-    { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv; }
-    { uint32_t r = cpu_ldl_be_data(e, a); frn_rbw_check(e, a, 4, r); return r; }
+    { uint32_t fv; if (frn_force_lookup(a, &fv)) {
+        if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, fv);
+        return fv; } }
+    { uint32_t r = cpu_ldl_be_data(e, a); frn_rbw_check(e, a, 4, r);
+      if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, r);
+      return r; }
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
