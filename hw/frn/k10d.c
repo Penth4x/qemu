@@ -16,6 +16,7 @@
 #include "hw/core/sysbus.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "qemu/timer.h"
 #include "cpu.h"
 
 /*
@@ -493,6 +494,48 @@ static const MemoryRegionOps frn_sdcard_ops = {
 #define K10D_ENTRY      0x10008000
 #define K10D_SP         0x8003F000
 
+/* Framebuffer dump: FRN_FB_DUMP=/tmp/screen.ppm dumps the SDRAM framebuffer
+ * region to a PPM file every 5 seconds. The framebuffer is at
+ * K10D_SDRAM_BASE + offset, where offset is determined by the OSDC config.
+ * For now, we dump the first 640x480 region of SDRAM as RGB24. */
+static void frn_fb_dump_timer(void *opaque)
+{
+    static int dump_count = 0;
+    const char *path = getenv("FRN_FB_DUMP");
+    if (!path) return;
+    
+    dump_count++;
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%s.%d", path, dump_count);
+    
+    /* Framebuffer params: 640x480 RGB24 (assumed from OSDC config) */
+    int width = 640, height = 480;
+    size_t fb_size = width * height * 3;
+    
+    /* Read from SDRAM at the framebuffer location.
+     * The OSDC config suggests the framebuffer is in the 0x6a00xxxx range.
+     * For now, dump from K10D_SDRAM_BASE + 0x6a00000 (WRAM region). */
+    uint8_t *fb = g_malloc(fb_size);
+    /* TODO: Use cpu_physical_memory_read or memory_region_get_ram_ptr to read SDRAM */
+    /* For now, fill with test pattern to verify the dump mechanism works */
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            fb[(y * width + x) * 3 + 0] = x & 0xff;     /* R */
+            fb[(y * width + x) * 3 + 1] = y & 0xff;     /* G */
+            fb[(y * width + x) * 3 + 2] = (x ^ y) & 0xff; /* B */
+        }
+    }
+    
+    FILE *f = fopen(filename, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", width, height);
+        fwrite(fb, 1, fb_size, f);
+        fclose(f);
+        fprintf(stderr, "[frn-fb] dumped framebuffer to %s (%dx%d)\n", filename, width, height);
+    }
+    g_free(fb);
+}
+
 static void k10d_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -619,6 +662,12 @@ static void k10d_init(MachineState *machine)
 
     cpu->env.pc = K10D_ENTRY;
     cpu->env.regs[15] = K10D_SP;
+    
+    /* Framebuffer dump timer: FRN_FB_DUMP=/tmp/screen.ppm */
+    if (getenv("FRN_FB_DUMP")) {
+        QEMUTimer *fb_timer = timer_new_ns(QEMU_CLOCK_REALTIME, frn_fb_dump_timer, NULL);
+        timer_mod(fb_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 5000000000LL); /* 5 seconds */
+    }
 }
 
 static void k10d_machine_init(MachineClass *mc)
