@@ -513,16 +513,28 @@ static void frn_fb_dump_timer(void *opaque)
     size_t fb_size = width * height * 3;
     
     /* Read from SDRAM at the framebuffer location.
-     * The OSDC config suggests the framebuffer is in the 0x6a00xxxx range.
-     * For now, dump from K10D_SDRAM_BASE + 0x6a00000 (WRAM region). */
+     * The OSDC config suggests the framebuffer is in the 0x80008000 range
+     * (per prior analysis: dense, structured UI data).
+     * Use address_space_read to read from the physical address. */
     uint8_t *fb = g_malloc(fb_size);
-    /* TODO: Use cpu_physical_memory_read or memory_region_get_ram_ptr to read SDRAM */
-    /* For now, fill with test pattern to verify the dump mechanism works */
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            fb[(y * width + x) * 3 + 0] = x & 0xff;     /* R */
-            fb[(y * width + x) * 3 + 1] = y & 0xff;     /* G */
-            fb[(y * width + x) * 3 + 2] = (x ^ y) & 0xff; /* B */
+    
+    /* Framebuffer physical address: 0x80008000 (SDRAM) */
+    hwaddr fb_phys = 0x80008000;
+    AddressSpace *as = &address_space_memory;
+    MemTxResult result = address_space_read(as, fb_phys, MEMTXATTRS_UNSPECIFIED, fb, fb_size);
+    if (result == MEMTX_OK) {
+        fprintf(stderr, "[frn-fb] read framebuffer from 0x%lx (%zu bytes)\n", 
+                (unsigned long)fb_phys, fb_size);
+    } else {
+        fprintf(stderr, "[frn-fb] ERROR: address_space_read failed at 0x%lx\n", 
+                (unsigned long)fb_phys);
+        /* Fill with test pattern as fallback */
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                fb[(y * width + x) * 3 + 0] = x & 0xff;     /* R */
+                fb[(y * width + x) * 3 + 1] = y & 0xff;     /* G */
+                fb[(y * width + x) * 3 + 2] = (x ^ y) & 0xff; /* B */
+            }
         }
     }
     
