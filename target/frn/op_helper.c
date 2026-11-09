@@ -499,6 +499,7 @@ static void frn_spi_init(void)
 static long     frn_ic = 0;              /* global instruction counter */
 static int      frn_ft_on = -1, frn_ft_active = 0;
 static long     frn_ft_from = 0, frn_ft_to = 0, frn_ft_win = 200000, frn_ft_pcstart = 0, frn_ft_started = 0;
+static int      frn_ft_fullregs = 0;     /* FRN_FT_FULLREGS=1: log all 16 regs per line */
 static FILE    *frn_ft_fp = NULL;
 static void frn_ft_init(void)
 {
@@ -512,6 +513,7 @@ static void frn_ft_init(void)
     const char *b = getenv("FRN_FT_TO");   if (b) frn_ft_to   = strtol(b, NULL, 0);
     const char *p = getenv("FRN_FT_PC");   if (p) frn_ft_pcstart = strtoul(p, NULL, 16);
     const char *w = getenv("FRN_FT_WIN");  if (w) frn_ft_win = strtol(w, NULL, 0);
+    const char *f = getenv("FRN_FT_FULLREGS"); if (f) frn_ft_fullregs = 1;
 }
 static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
 {
@@ -1161,9 +1163,14 @@ void HELPER(frn_interp)(CPUFRNState *env)
         frn_ft_active = (frn_ic >= frn_ft_from &&
                          (frn_ft_to == 0 || frn_ic <= frn_ft_to) &&
                          (!frn_ft_pcstart || frn_ft_started));
-        if (frn_ft_active)
-            fprintf(frn_ft_fp, "%ld PC=0x%08x r4=%08x r5=%08x r8=%08x r13=%08x\n",
-                    frn_ic, pc, r[4], r[5], r[8], r[13]);
+        if (frn_ft_active) {
+            if (frn_ft_fullregs)
+                fprintf(frn_ft_fp, "%ld PC=0x%08x r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x r13=%08x r14=%08x r15=%08x\n",
+                        frn_ic, pc, r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
+            else
+                fprintf(frn_ft_fp, "%ld PC=0x%08x r4=%08x r5=%08x r8=%08x r13=%08x\n",
+                        frn_ic, pc, r[4], r[5], r[8], r[13]);
+        }
     }
     /* FRN_LOG_USER: holistic handover map — log every transition of the live S-flag
      * (env->sf): 0->1 = entry to USER mode (userland handover), 1->0 = back to system.
