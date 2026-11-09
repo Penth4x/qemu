@@ -431,7 +431,7 @@ static uint64_t frn_osdc_read(void *opaque, hwaddr off, unsigned size)
     for (unsigned i = 0; i < size; i++)
         v = (v << 8) | frn_osdc_mem[(off + i) & 0x3f];   /* big-endian */
     if (off == 0x00 || off == 0x10 || off == 0x20 || off == 0x30)
-        v |= 0x0cu;                                        /* frame-ready (bits 2,3) */
+        v |= 0x0du;                                        /* bit0=mode-ready gate, bits2,3=frame-ready */
     return v;
 }
 static void frn_osdc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
