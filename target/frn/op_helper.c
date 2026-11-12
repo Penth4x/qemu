@@ -375,6 +375,91 @@ static inline void frn_rd_watch(CPUFRNState *e, uint32_t a)
  * read at addr. Lets me force a specific flag (e.g. the date-set bit) to a value
  * to test a gate hypothesis without patching the ROM. Width-agnostic: the value
  * is returned for the covering access. */
+/* Execution steering, for exploring code the natural run never reaches.
+ *   FRN_STEER=pc[:nth]:t|f[,...]          force the conditional branch at pc taken (t)
+ *                                          or fall-through (f); nth (decimal, 1-based)
+ *                                          limits it to that execution, else every one.
+ *   FRN_STEER_CALL=pc[:nth]:target[,...]  at call @Ri / call:D @Ri at pc, call target
+ *                                          (hex) instead of Ri — walks vtable slots.
+ * Every steered event is logged "[steer]" so a trace records its counterfactuals. */
+#define FRN_STEER_MAX 256
+typedef struct { uint32_t pc, nth, val, seen; } FrnSteer;
+static FrnSteer frn_steer_br[FRN_STEER_MAX], frn_steer_cl[FRN_STEER_MAX];
+static int frn_steer_br_n = -1, frn_steer_cl_n = -1;
+static FILE *frn_ft_fp;   /* defined with the FRN_FT tracer below */
+
+/* Steer events go into the FRN_FT trace when it is open, so a trace records
+ * its own counterfactuals; otherwise to the IRQ-trace stream. */
+static FILE *frn_steer_out(void)
+{
+    return frn_ft_fp ? frn_ft_fp : (frn_tr_out ? frn_tr_out : stderr);
+}
+
+static int frn_steer_parse(const char *s, FrnSteer *tab, int is_call)
+{
+    int n = 0;
+    while (s && *s && n < FRN_STEER_MAX) {
+        char *e;
+        unsigned long pc = strtoul(s, &e, 16);
+        if (e == s || *e != ':') break;
+        s = e + 1;
+        unsigned long nth = 0, val;
+        /* optional decimal nth: present iff another ':' follows the next field */
+        const char *colon = strchr(s, ':'), *comma = strchr(s, ',');
+        if (colon && (!comma || colon < comma)) {
+            nth = strtoul(s, &e, 10);
+            if (e == s || *e != ':') break;
+            s = e + 1;
+        }
+        if (is_call) {
+            val = strtoul(s, &e, 16);
+            if (e == s) break;
+            s = e;
+        } else {
+            if (*s != 't' && *s != 'f') break;
+            val = (*s == 't');
+            s++;
+        }
+        tab[n].pc = (uint32_t)pc; tab[n].nth = (uint32_t)nth;
+        tab[n].val = (uint32_t)val; tab[n].seen = 0;
+        n++;
+        if (*s != ',') break;
+        s++;
+    }
+    return n;
+}
+
+static int frn_steer_lookup(FrnSteer *tab, int n, uint32_t pc, uint32_t *out)
+{
+    for (int i = 0; i < n; i++) {
+        if (tab[i].pc != pc) continue;
+        tab[i].seen++;
+        if (tab[i].nth == 0 || tab[i].seen == tab[i].nth) { *out = tab[i].val; return 1; }
+    }
+    return 0;
+}
+
+static int frn_steer_branch(uint32_t pc, int natural, int *take)
+{
+    if (frn_steer_br_n < 0) frn_steer_br_n = frn_steer_parse(getenv("FRN_STEER"), frn_steer_br, 0);
+    uint32_t v;
+    if (!frn_steer_br_n || !frn_steer_lookup(frn_steer_br, frn_steer_br_n, pc, &v)) return 0;
+    *take = (int)v;
+    fprintf(frn_steer_out(), "[steer] branch pc=%08x forced=%c natural=%c\n",
+            pc, v ? 't' : 'f', natural ? 't' : 'f');
+    return 1;
+}
+
+static uint32_t frn_steer_call(uint32_t pc, uint32_t natural)
+{
+    if (frn_steer_cl_n < 0) frn_steer_cl_n = frn_steer_parse(getenv("FRN_STEER_CALL"), frn_steer_cl, 1);
+    uint32_t v;
+    if (!frn_steer_cl_n || !frn_steer_lookup(frn_steer_cl, frn_steer_cl_n, pc, &v)) return natural;
+    fprintf(frn_steer_out(), "[steer] call pc=%08x forced=%08x natural=%08x\n",
+            pc, v, natural);
+    return v;
+}
+
 #define FRN_FORCE_MAX 8
 static uint32_t frn_force_a[FRN_FORCE_MAX], frn_force_v[FRN_FORCE_MAX];
 static int frn_force_n = -1;
@@ -659,6 +744,12 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
     if (a == SPI_STATUS) { frn_spi_init();
         uint32_t r = cpu_lduw_be_data(e, a);
         if (frn_spi_on) r &= ~0x0400u;   /* black-box DSP: transfer completes instantly (busy clear) */
+        /* FRN_SPI_BUSY=N (opt-in): hold BUSY for N status reads after each start, so
+         * the firmware's busy-wait takes its slow-peripheral path (FUN_10466234) as on
+         * real hardware. Unset = instant completion (unchanged). */
+        { static int hold = -1; if (hold < 0) { const char *h = getenv("FRN_SPI_BUSY"); hold = h ? atoi(h) : 0; }
+          if (frn_spi_on && hold > 0 && frn_spi_busy > 0) {
+              if (frn_spi_busy++ <= hold) r |= 0x0400u; else frn_spi_busy = 0; } }
         return r; }
     if (a == 0x5e) { static int off = -1; if (off < 0) off = getenv("FRN_DSP_OFF") ? 1 : 0;
         frn_dsp_init();
@@ -1451,9 +1542,9 @@ void HELPER(frn_interp)(CPUFRNState *env)
             if (frn_tr_irq && !f && _vn < 16) { _vs[_vn++] = r[ri];
                 fprintf(frn_tr_out ? frn_tr_out : stderr, "[task1-vtable] pc=%08x -> method=%08x (obj r4=%08x)\n", pc, r[ri], r[4]); }
         }
-        do_call(env, r[ri], pc + 2, 0); break;
+        do_call(env, frn_steer_call(pc, r[ri]), pc + 2, 0); break;
     }   /* call @ri */
-    if (t12 == 0x9F1) { do_call(env, r[ri], pc + 4, 1); break; }   /* call:D @ri */
+    if (t12 == 0x9F1) { do_call(env, frn_steer_call(pc, r[ri]), pc + 4, 1); break; }   /* call:D @ri */
     if (t12 == 0x070) { r[ri] = rd32(env, r[15]); if (ri != 15) r[15] += 4; break; } /* ld @r15+,ri */
     if (t12 == 0x078) { set_sr(env, ri, rd32(env, r[15])); r[15] += 4; break; }  /* ld @r15+,Rs */
     if (t12 == 0x170) { push32(env, r[ri]); break; }               /* st ri,@-r15 */
@@ -1475,13 +1566,11 @@ void HELPER(frn_interp)(CPUFRNState *env)
         int op_b = (w >> 8) & 0xf;
         int32_t disp = (td & 0x80) ? (int32_t)td - 0x100 : (int32_t)td;
         uint32_t target = pc + 2 + disp * 2;
-        if (hi4 == 0xE) {
-            if (op_b == 0) env->pc = target;
-            else if (op_b == 1) { }
-            else if (cond(env, op_b)) env->pc = target;
-        } else {
-            if (op_b == 1) { }
-            else if (op_b == 0 || cond(env, op_b)) go(env, target, 1);
+        int take = op_b == 0 || (op_b != 1 && cond(env, op_b));
+        if (op_b >= 2) frn_steer_branch(pc, take, &take);
+        if (take) {
+            if (hi4 == 0xE) env->pc = target;
+            else go(env, target, 1);
         }
         break;
     }
