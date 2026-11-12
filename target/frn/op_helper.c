@@ -744,10 +744,13 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
     if (a == SPI_STATUS) { frn_spi_init();
         uint32_t r = cpu_lduw_be_data(e, a);
         if (frn_spi_on) r &= ~0x0400u;   /* black-box DSP: transfer completes instantly (busy clear) */
-        /* FRN_SPI_BUSY=N (opt-in): hold BUSY for N status reads after each start, so
-         * the firmware's busy-wait takes its slow-peripheral path (FUN_10466234) as on
-         * real hardware. Unset = instant completion (unchanged). */
-        { static int hold = -1; if (hold < 0) { const char *h = getenv("FRN_SPI_BUSY"); hold = h ? atoi(h) : 0; }
+        /* Hold BUSY for N status reads after each start (FRN_SPI_BUSY=N, default 20;
+         * 0 = instant completion). Real transfers take time, and the firmware's
+         * busy-wait then takes its slow-peripheral path (FUN_10466234), which lets
+         * lower-priority tasks run. With instant completion the self-re-arming
+         * Cmd:01 status poll never yields and starves the startup task: boot never
+         * reaches app_mode_activate or keypad setup. */
+        { static int hold = -1; if (hold < 0) { const char *h = getenv("FRN_SPI_BUSY"); hold = h ? atoi(h) : 20; }
           if (frn_spi_on && hold > 0 && frn_spi_busy > 0) {
               if (frn_spi_busy++ <= hold) r |= 0x0400u; else frn_spi_busy = 0; } }
         return r; }
