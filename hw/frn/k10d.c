@@ -426,17 +426,52 @@ static const MemoryRegionOps frn_wc_ops = {
  * Pairs with the vec53 autotimer: together they are the modeled OSDC frame source.
  */
 static uint8_t frn_osdc_mem[0x40];
+/* Channel-0 one-shot timer state (see frn_osdc_read). Tick rate FRN_TMR_HZ, default
+ * 2062000 Hz: the firmware's 50 ms CPUCOM timeout is programmed as 103099 ticks. */
+static int frn_tmr0_run, frn_tmr0_uf_latched;
+static int64_t frn_tmr0_start, frn_tmr0_dur;
+static int64_t frn_tmr_hz(void)
+{
+    static int64_t hz;
+    if (!hz) { const char *e = getenv("FRN_TMR_HZ"); hz = e ? strtoll(e, NULL, 0) : 2062000; if (hz <= 0) hz = 2062000; }
+    return hz;
+}
+static int frn_tmr0_uf(void)
+{
+    if (frn_tmr0_run && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - frn_tmr0_start >= frn_tmr0_dur) {
+        frn_tmr0_uf_latched = 1; frn_tmr0_run = 0;
+    }
+    return frn_tmr0_uf_latched;
+}
 static uint64_t frn_osdc_read(void *opaque, hwaddr off, unsigned size)
 {
     uint64_t v = 0;
     for (unsigned i = 0; i < size; i++)
         v = (v << 8) | frn_osdc_mem[(off + i) & 0x3f];   /* big-endian */
-    if (off == 0x00 || off == 0x10 || off == 0x20 || off == 0x30)
+    if (off == 0x00 && size == 2) {
+        /* Channel 0 is the CPUCOM transfer-timeout timer (cpucom_spi_xfer starts it with
+         * reload 0x192bb = 50 ms, tests UF bit2 in FUN_1043c712, stops it with 0). A
+         * permanently-set UF made every slow transfer time out at once (CPUCOM ERROR
+         * Code:00010003). Model it as a one-shot reload timer. */
+        return (v & ~0x0004u) | (frn_tmr0_uf() ? 0x0004u : 0);
+    }
+    if (off == 0x10 || off == 0x20 || off == 0x30)
         v |= 0x0du;                                        /* bit0=mode-ready gate, bits2,3=frame-ready */
     return v;
 }
 static void frn_osdc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
+    if (off == 0x00 && size == 2) {   /* channel 0 control (TMCSR-like): TRG/CNTE/UF */
+        if (!(val & 0x0002u)) frn_tmr0_run = 0;                       /* CNTE=0: stop */
+        if (!(val & 0x0004u)) frn_tmr0_uf_latched = 0;                /* UF written 0: clear */
+        if ((val & 0x0003u) == 0x0003u) {                             /* CNTE+TRG: (re)start */
+            uint32_t reload = ((uint32_t)frn_osdc_mem[8] << 24) | ((uint32_t)frn_osdc_mem[9] << 16) |
+                              ((uint32_t)frn_osdc_mem[10] << 8) | frn_osdc_mem[11];
+            frn_tmr0_run = 1; frn_tmr0_uf_latched = 0;
+            frn_tmr0_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            frn_tmr0_dur = (int64_t)reload * 1000000000LL / frn_tmr_hz();
+        }
+    }
     for (unsigned i = 0; i < size; i++)
         frn_osdc_mem[(off + size - 1 - i) & 0x3f] = (uint8_t)(val >> (8 * i));
 }
