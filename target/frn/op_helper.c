@@ -606,6 +606,70 @@ static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
     if (kind == 'W') fprintf(frn_ft_fp, "  W%d @0x%08x =0x%08x\n", sz, a, v);
     else             fprintf(frn_ft_fp, "  R%d @0x%08x\n", sz, a);
 }
+/* --- Reload-timer bank at 0x5c002000-0x5c00203f (4 channels, stride 0x10) --------
+ * Semantics come from the firmware's own timer driver (vtable 0x105a05a0; objects
+ * at 0x805520b4/8c/64/3c, ctrl ptr at +0x18, count ptr at +0x1c):
+ *   +0 ctrl (16-bit): bit0 EN (start/run), bit1 set by every configure (0x1002),
+ *     bit2 UF (expired; writing 1 keeps it, writing 0 clears it), bit3 INTE,
+ *     bit4 reload/periodic, bit11 prescale (set = /16: 2.0625 MHz, ms units via
+ *     n*0x80e-1; clear = 33 MHz, us units via n*0x21-1), bit12 held during load.
+ *   +8 count/reload (32-bit).
+ * The delay routine FUN_1043c7b8 starts a channel and spins until UF; the timer
+ * interrupt (vec56, ISR 0x1043ce50) posts event 0x2c+ch for each channel with
+ * INTE|UF set and the ISR rewrites ctrl to clear UF.
+ * Time base: instructions. FRN_TMR_IPT = instructions per 33 MHz tick (default 1). */
+#define FRN_TMR_BASE 0x5c002000u
+#define FRN_TMR_VEC  56
+static long frn_tmr_deadline[4];
+static uint8_t frn_tmr_run[4], frn_tmr_uf[4];
+static long frn_tmr_ipt = -1;
+static void frn_tmr_poll(CPUFRNState *e, int ch)
+{
+    if (!frn_tmr_run[ch] || frn_ic < frn_tmr_deadline[ch]) return;
+    frn_tmr_uf[ch] = 1;
+    uint32_t ctrl = cpu_lduw_be_data(e, FRN_TMR_BASE + ch * 0x10);
+    if (ctrl & 0x10) {             /* reload mode: next period */
+        uint32_t rl = cpu_ldl_be_data(e, FRN_TMR_BASE + ch * 0x10 + 8);
+        long per = ((long)rl + 1) * ((ctrl & 0x800) ? 16 : 1) * frn_tmr_ipt;
+        frn_tmr_deadline[ch] += per > 0 ? per : 1;
+    } else {
+        frn_tmr_run[ch] = 0;
+    }
+}
+static int frn_tmr_ch(uint32_t a)
+{
+    return (a >= FRN_TMR_BASE && a < FRN_TMR_BASE + 0x40 && (a & 0xf) == 0) ? (int)((a - FRN_TMR_BASE) >> 4) : -1;
+}
+/* After the firmware's ctrl write has been stored. */
+static void frn_tmr_ctrl_written(CPUFRNState *e, int ch, uint32_t v)
+{
+    if (frn_tmr_ipt < 0) { const char *s = getenv("FRN_TMR_IPT"); frn_tmr_ipt = s ? strtol(s, NULL, 0) : 1;
+                           if (frn_tmr_ipt < 1) frn_tmr_ipt = 1; }
+    frn_tmr_poll(e, ch);
+    if (!(v & 0x4)) frn_tmr_uf[ch] = 0;
+    if (!(v & 0x1)) { frn_tmr_run[ch] = 0; return; }
+    if (!frn_tmr_run[ch] && !(v & 0x1000)) {
+        uint32_t rl = cpu_ldl_be_data(e, FRN_TMR_BASE + ch * 0x10 + 8);
+        frn_tmr_deadline[ch] = frn_ic + ((long)rl + 1) * ((v & 0x800) ? 16 : 1) * frn_tmr_ipt;
+        frn_tmr_run[ch] = 1;
+    }
+}
+static uint32_t frn_tmr_ctrl_read(CPUFRNState *e, int ch, uint32_t stored)
+{
+    frn_tmr_poll(e, ch);
+    return (stored & ~0x4u) | (frn_tmr_uf[ch] ? 0x4u : 0);
+}
+/* vec56 level: any channel with INTE and UF. */
+static int frn_tmr_irq(CPUFRNState *e)
+{
+    int any = 0;
+    for (int ch = 0; ch < 4; ch++) {
+        frn_tmr_poll(e, ch);
+        if (frn_tmr_uf[ch] && (cpu_lduw_be_data(e, FRN_TMR_BASE + ch * 0x10) & 0x8)) any = 1;
+    }
+    return any;
+}
+
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
     frn_ft_mem('R', a, 0, 1);
@@ -741,15 +805,16 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
      * send loop (cpucom_sci_send_byte 0x1043c186) busy-waits while((st & 4)==0);
      * 0x5e is RAM so bit2 never sets -> spin. Report TX-complete so the send
      * progresses and the DSP handshake can proceed. Gated by FRN_DSP_OFF to disable. */
+    { int ch = frn_tmr_ch(a); if (ch >= 0) {
+        uint32_t r = frn_tmr_ctrl_read(e, ch, cpu_lduw_be_data(e, a));
+        if (frn_ft_active) fprintf(frn_ft_fp, "  R2 @0x%08x =0x%08x\n", a, r);
+        return r; } }
     if (a == SPI_STATUS) { frn_spi_init();
         uint32_t r = cpu_lduw_be_data(e, a);
         if (frn_spi_on) r &= ~0x0400u;   /* black-box DSP: transfer completes instantly (busy clear) */
         /* Hold BUSY for N status reads after each start (FRN_SPI_BUSY=N, default 20;
-         * 0 = instant completion). Real transfers take time, and the firmware's
-         * busy-wait then takes its slow-peripheral path (FUN_10466234), which lets
-         * lower-priority tasks run. With instant completion the self-re-arming
-         * Cmd:01 status poll never yields and starves the startup task: boot never
-         * reaches app_mode_activate or keypad setup. */
+         * 0 = instant completion). Real transfers take time; while BUSY the firmware
+         * polls its 50 ms timeout timer (FUN_10466234 -> timer channel 0). */
         { static int hold = -1; if (hold < 0) { const char *h = getenv("FRN_SPI_BUSY"); hold = h ? atoi(h) : 20; }
           if (frn_spi_on && hold > 0 && frn_spi_busy > 0) {
               if (frn_spi_busy++ <= hold) r |= 0x0400u; else frn_spi_busy = 0; } }
@@ -788,6 +853,7 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     frn_ft_mem('W', a, v, 2);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
+    { int ch = frn_tmr_ch(a); if (ch >= 0) frn_tmr_ctrl_written(e, ch, v & 0xffff); }
     /* CPUCOM SPI black-box: status write with config bit 0x200 = a new transaction
      * is being set up -> reset the per-byte response position. */
     if (a == SPI_STATUS) { frn_spi_init(); if (frn_spi_on) {
@@ -1043,8 +1109,8 @@ static void frn_fire_tick(CPUFRNState *e)
  * frame ready, modeled in k10d.c) and dispatches OSDC events 0x2c-0x2f; event 0x2d
  * sets Task23's render eventflag 0x804a976c. vec53 (OSDC MAIN) is NOT armed in this
  * boot (autotimer skips masked ICRs); vec56 is the live display IRQ. */
-#define FRN_AUTOTIMER_N 6
-static const uint32_t frn_autotimer_vec[FRN_AUTOTIMER_N] = { 43, 48, 49, 50, 53, 56 };
+#define FRN_AUTOTIMER_N 5
+static const uint32_t frn_autotimer_vec[FRN_AUTOTIMER_N] = { 43, 48, 49, 50, 53 };   /* vec56 = timer bank, modeled (frn_tmr_*) */
 static uint32_t frn_autotimer_div[FRN_AUTOTIMER_N];
 static uint8_t  frn_autotimer_pending[FRN_AUTOTIMER_N];
 static long frn_autotimer_period = 200000;
@@ -1070,8 +1136,8 @@ static void frn_autotimer_tick(CPUFRNState *e)
 static void frn_deliver(CPUFRNState *e)
 {
     if (!e->i_flag) return;
-    uint32_t lev[3 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[3 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
-    int kind[3 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
+    uint32_t lev[4 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[4 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    int kind[4 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
     if (e->dicr_pending)  { lev[n] = cpu_ldub_data(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
     if (e->wc_pending)    { lev[n] = cpu_ldub_data(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
@@ -1086,6 +1152,10 @@ static void frn_deliver(CPUFRNState *e)
             lev[n] = cpu_ldub_data(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
             vec[n] = frn_autotimer_vec[i]; kind[n] = 30 + i; n++;
         }
+    }
+    if (frn_tmr_irq(e)) {
+        lev[n] = cpu_ldub_data(e, 0x440 + (FRN_TMR_VEC - 16)) & 0x1F;
+        vec[n] = FRN_TMR_VEC; kind[n] = 3; n++;
     }
     if (n == 0) return;
     /* insertion sort ascending by level (highest priority = lowest number first) */
@@ -1114,7 +1184,7 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_tr_irq) {
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
                     "from 0x%08x\n", vec[i],
-                    kind[i]==0?"timer":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]>=30?"autotmr":"fire",
+                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]>=30?"autotmr":"fire",
                     handler, lev[i], rd32(e, e->regs[15]));
         }
         return;
