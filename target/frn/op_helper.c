@@ -1548,6 +1548,12 @@ void HELPER(frn_interp)(CPUFRNState *env)
     /* FRN_LOG_FLG: log the eventflag id (low16 of *(r4)) at wai_flg/set_flg/clr_flg entry,
      * to discover the REAL ids the firmware waits/sets (e.g. what task23 blocks on). */
     { static int lf = -1; if (lf < 0) lf = getenv("FRN_LOG_FLG") ? 1 : 0;
+      /* Kernel twai_flg service itself (0x100112a4: r4=flgid, r5=waiptn, r6=wfmode,
+       * r7=p_flgptn, timeout on the stack): catches waits that bypass the wrappers. */
+      if (lf && pc == 0x100112a4u)
+        fprintf(frn_tr_out ? frn_tr_out : stderr,
+            "[flg] twai_flg_svc id=0x%04x pat=0x%08x mode=%u tmo=%d from rp~0x%08x\n",
+            r[4] & 0xffff, r[5], r[6], (int)cpu_ldl_be_data(env, r[15]), env->rp);
       if (lf && (pc == 0x10459708u || pc == 0x104596ccu || pc == 0x104596e6u)) {
         uint32_t idp = r[4]; uint32_t idw = 0;
         if (idp >= 0x80000000u && idp < 0x84000000u) idw = cpu_ldl_be_data(env, idp);
