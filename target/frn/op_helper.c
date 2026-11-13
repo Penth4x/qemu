@@ -388,6 +388,135 @@ static FrnSteer frn_steer_br[FRN_STEER_MAX], frn_steer_cl[FRN_STEER_MAX];
 static int frn_steer_br_n = -1, frn_steer_cl_n = -1;
 static FILE *frn_ft_fp;   /* defined with the FRN_FT tracer below */
 
+/* --- Argument recorder (FRN_ARGS) ---------------------------------------------
+ * FRN_ARGS=path: for every called function, classify the argument registers r4-r7
+ * at the callee's first instruction (after any call:D delay slot) and count the
+ * loads/stores the callee itself makes in [arg, arg+0x400): proof that an argument
+ * is a pointer, with the largest field offset used. Frames are a shadow call stack
+ * popped when execution reaches a frame's return address; accesses count only while
+ * SP is within the frame's stack (a task switch runs on another stack).
+ * Each call is filed as natural or steered: steered once any FRN_STEER/FRN_STEER_CALL
+ * has overridden the firmware's own choice, since later state is not the firmware's.
+ * The summary file is rewritten every FRN_ARGS_EVERY recorded calls (default 1M) and
+ * at exit. Line format, one per (function, mode):
+ *   <va> <natural|steered> calls=<n> a<i>=<zero>,<small>,<neg>,<rom>,<sdram>,<io>,<other>
+ *        :deref=<n>:maxoff=0x<off>:sample=0x<v>   (i = 0..3 for r4..r7)            */
+#define FA_CLS 7
+#define FA_MAXOFF 0x400u
+#define FA_DEPTH 256
+typedef struct {
+    uint32_t va, used, calls[2];
+    uint32_t cls[2][4][FA_CLS], deref[2][4], maxoff[2][4], sample[2][4];
+} FaEnt;
+typedef struct { uint32_t ret, sp, a[4]; FaEnt *e; int st; } FaFrame;
+static int fa_on = -1, frn_steered = 0, fa_sp = 0;
+static const char *fa_path;
+static FaEnt *fa_tab; static uint32_t fa_cap = 1u << 16, fa_used = 0;
+static uint64_t fa_n = 0, fa_every = 1000000;
+static uint32_t fa_pending = 0xffffffffu, fa_pending_ret;
+static FaFrame fa_stack[FA_DEPTH];
+static uint32_t *fa_regs;
+
+static int fa_class(uint32_t v)
+{
+    if (v == 0) return 0;
+    if (v < 0x10000u) return 1;
+    if (v >= 0xffff0000u) return 2;
+    if (v >= 0x10000000u && v < 0x11000000u) return 3;
+    if (v >= 0x80000000u && v < 0x90000000u) return 4;
+    if (v >= 0x20000000u && v < 0x80000000u) return 5;
+    return 6;
+}
+static void fa_dump(void)
+{
+    if (fa_on != 1) return;
+    char tmp[600]; snprintf(tmp, sizeof tmp, "%s.tmp", fa_path);
+    FILE *f = fopen(tmp, "w"); if (!f) return;
+    for (uint32_t i = 0; i < fa_cap; i++) {
+        FaEnt *e = &fa_tab[i]; if (!e->used) continue;
+        for (int st = 0; st < 2; st++) {
+            if (!e->calls[st]) continue;
+            fprintf(f, "%08x %s calls=%u", e->va, st ? "steered" : "natural", e->calls[st]);
+            for (int a = 0; a < 4; a++) {
+                fprintf(f, " a%d=", a);
+                for (int c = 0; c < FA_CLS; c++) fprintf(f, c ? ",%u" : "%u", e->cls[st][a][c]);
+                fprintf(f, ":deref=%u:maxoff=0x%x:sample=0x%08x",
+                        e->deref[st][a], e->maxoff[st][a], e->sample[st][a]);
+            }
+            fputc('\n', f);
+        }
+    }
+    fclose(f); rename(tmp, fa_path);
+}
+static int fa_init(void)
+{
+    if (fa_on >= 0) return fa_on;
+    fa_path = getenv("FRN_ARGS");
+    fa_on = (fa_path && fa_path[0]) ? 1 : 0;
+    if (fa_on) {
+        const char *s = getenv("FRN_ARGS_EVERY"); if (s) fa_every = strtoull(s, NULL, 0);
+        fa_tab = calloc(fa_cap, sizeof(FaEnt));
+        if (!fa_tab) fa_on = 0; else atexit(fa_dump);
+    }
+    return fa_on;
+}
+static FaEnt *fa_get(uint32_t va)
+{
+    if (fa_used * 2 >= fa_cap) return NULL;          /* table full: stop adding */
+    uint32_t h = (va >> 1) * 2654435761u;
+    for (uint32_t i = 0; i < fa_cap; i++) {
+        FaEnt *e = &fa_tab[(h + i) & (fa_cap - 1)];
+        if (e->used && e->va == va) return e;
+        if (!e->used) { e->used = 1; e->va = va; fa_used++; return e; }
+    }
+    return NULL;
+}
+/* do_call: remember the target; the arguments are read when it is reached. */
+static inline void fa_call(uint32_t target, uint32_t ret)
+{
+    if (fa_init() != 1) return;
+    fa_pending = target; fa_pending_ret = ret;
+}
+/* Every instruction, before it executes. */
+static inline void fa_step(uint32_t pc, uint32_t *r)
+{
+    if (fa_on != 1) return;
+    fa_regs = r;
+    for (int k = fa_sp - 1; k >= 0 && k >= fa_sp - 8; k--)
+        if (fa_stack[k].ret == pc) { fa_sp = k; break; }
+    if (pc != fa_pending) return;
+    fa_pending = 0xffffffffu;
+    FaEnt *e = fa_get(pc); if (!e) return;
+    int st = frn_steered;
+    e->calls[st]++;
+    if (fa_sp == FA_DEPTH) fa_sp = 0;                /* lost track (task switches): restart */
+    FaFrame *fr = &fa_stack[fa_sp++];
+    fr->ret = fa_pending_ret; fr->sp = r[15]; fr->e = e; fr->st = st;
+    for (int a = 0; a < 4; a++) {
+        uint32_t v = r[4 + a]; fr->a[a] = v;
+        e->cls[st][a][fa_class(v)]++;
+        if (fa_class(v) >= 3) e->sample[st][a] = v;
+        else if (!e->sample[st][a]) e->sample[st][a] = v;
+    }
+    if (++fa_n % fa_every == 0) fa_dump();
+}
+/* Every load/store the firmware makes. */
+static inline void fa_mem(uint32_t addr)
+{
+    if (fa_on != 1 || !fa_sp || !fa_regs) return;
+    FaFrame *fr = &fa_stack[fa_sp - 1];
+    uint32_t sp = fa_regs[15];
+    if (sp > fr->sp || fr->sp - sp > 0x4000u) return;   /* not this frame's stack */
+    for (int a = 0; a < 4; a++) {
+        uint32_t v = fr->a[a];
+        if (fa_class(v) < 3) continue;                   /* small/zero/negative: not a base */
+        if (addr >= v && addr - v < FA_MAXOFF) {
+            fr->e->deref[fr->st][a]++;
+            if (addr - v > fr->e->maxoff[fr->st][a]) fr->e->maxoff[fr->st][a] = addr - v;
+        }
+    }
+}
+
 /* Steer events go into the FRN_FT trace when it is open, so a trace records
  * its own counterfactuals; otherwise to the IRQ-trace stream. */
 static FILE *frn_steer_out(void)
@@ -445,6 +574,7 @@ static int frn_steer_branch(uint32_t pc, int natural, int *take)
     uint32_t v;
     if (!frn_steer_br_n || !frn_steer_lookup(frn_steer_br, frn_steer_br_n, pc, &v)) return 0;
     *take = (int)v;
+    if ((int)v != (natural != 0)) frn_steered = 1;
     fprintf(frn_steer_out(), "[steer] branch pc=%08x forced=%c natural=%c\n",
             pc, v ? 't' : 'f', natural ? 't' : 'f');
     return 1;
@@ -457,6 +587,7 @@ static uint32_t frn_steer_call(uint32_t pc, uint32_t natural)
     if (!frn_steer_cl_n || !frn_steer_lookup(frn_steer_cl, frn_steer_cl_n, pc, &v)) return natural;
     fprintf(frn_steer_out(), "[steer] call pc=%08x forced=%08x natural=%08x\n",
             pc, v, natural);
+    if (v != natural) frn_steered = 1;
     return v;
 }
 
@@ -602,6 +733,7 @@ static void frn_ft_init(void)
 }
 static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
 {
+    fa_mem(a);
     if (!frn_ft_active) return;
     if (kind == 'W') fprintf(frn_ft_fp, "  W%d @0x%08x =0x%08x\n", sz, a, v);
     else             fprintf(frn_ft_fp, "  R%d @0x%08x\n", sz, a);
@@ -839,6 +971,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
+    fa_mem(a);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) {
         if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, fv);
@@ -1016,7 +1149,7 @@ static inline void go(CPUFRNState *e, uint32_t target, int delayed) {
     else { e->pc = target; }
 }
 static inline void do_call(CPUFRNState *e, uint32_t target, uint32_t ret, int delayed) {
-    e->rp = ret; go(e, target, delayed);
+    e->rp = ret; fa_call(target, ret); go(e, target, delayed);
 }
 
 /* ---- Milbeaut reload timer + FR interrupt delivery (fremu port) ---- */
@@ -1316,6 +1449,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
     }
     frn_snapshot(env);
     uint32_t pc = env->pc;
+    fa_step(pc, r);
     frn_hist_tick(pc);
     /* Full execution + memory trace (windowed). */
     frn_ft_init();
