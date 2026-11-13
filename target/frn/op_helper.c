@@ -905,22 +905,28 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
             uint8_t b;
             uint8_t cmd = (frn_spi_txlen > 0) ? frn_spi_tx[0] : 0xff;
             if (cmd == 0x01) {
-                /* FRN_SPI_INJ=N:hexbytes — answer the N-th Cmd:01 poll (1-based) with this
-                 * full RX stream instead: a message the DSP originates, routed by its first
-                 * byte through the response registry (e.g. 41 09 ... = command 'A'). */
-                static int inj_n = -1, inj_len = 0, txn = 0; static uint8_t inj[64];
-                if (inj_n < 0) {
-                    inj_n = 0; const char *q = getenv("FRN_SPI_INJ");
-                    if (q) { inj_n = (int)strtol(q, (char **)&q, 0); if (*q == ':') q++;
-                        while (*q && inj_len < 64) { while (*q == ' ' || *q == ',') q++;
+                /* FRN_SPI_INJ=N:hexbytes[;N:hexbytes...] — answer the N-th Cmd:01 poll (1-based)
+                 * with this full RX stream instead: a message the DSP originates, routed by its
+                 * first byte through the response registry (e.g. 41 09 ... = command 'A'). */
+                static int inj_k = -1, txn = 0; static int inj_n[8], inj_len[8]; static uint8_t inj[8][80];
+                if (inj_k < 0) {
+                    inj_k = 0; const char *q = getenv("FRN_SPI_INJ");
+                    while (q && *q && inj_k < 8) {
+                        inj_n[inj_k] = (int)strtol(q, (char **)&q, 0); if (*q == ':') q++;
+                        inj_len[inj_k] = 0;
+                        while (*q && *q != ';' && inj_len[inj_k] < 80) { while (*q == ' ' || *q == ',') q++;
                             char hb[3] = {0}; int k = 0; while (k < 2 && isxdigit((unsigned char)*q)) hb[k++] = *q++;
-                            if (!k) break; inj[inj_len++] = (uint8_t)strtoul(hb, NULL, 16); } }
+                            if (!k) break; inj[inj_k][inj_len[inj_k]++] = (uint8_t)strtoul(hb, NULL, 16); }
+                        inj_k++; if (*q == ';') q++;
+                    }
                 }
                 if (frn_spi_pos == 0) txn++;
-                if (inj_n && txn == inj_n) {
-                    b = (frn_spi_pos < inj_len) ? inj[frn_spi_pos] : 0xff;
+                int hit = -1;
+                for (int k = 0; k < inj_k; k++) if (inj_n[k] == txn) hit = k;
+                if (hit >= 0) {
+                    b = (frn_spi_pos < inj_len[hit]) ? inj[hit][frn_spi_pos] : 0xff;
                     if (frn_spi_pos == 0) fprintf(frn_tr_out ? frn_tr_out : stderr,
-                        "[spi] injected DSP message on Cmd:01 poll #%d (resp0=0x%02x, %d bytes)\n", txn, inj[0], inj_len);
+                        "[spi] injected DSP message on Cmd:01 poll #%d (resp0=0x%02x, %d bytes)\n", txn, inj[hit][0], inj_len[hit]);
                 } else
                 b = (frn_spi_pos < frn_spi_r01_len) ? frn_spi_r01[frn_spi_pos] : 0xff;
             } else {
