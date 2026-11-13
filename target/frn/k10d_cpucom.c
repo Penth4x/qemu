@@ -24,7 +24,12 @@
  *  - Until 'A' arrives the main CPU polls ~300 times/s with status byte 3 = 0x10;
  *    the poll after 'A' carries 0x30. So bit 0x20 is the main CPU's "status
  *    received" acknowledgement, and the polling storm is it asking for 'A'.
- *  - After 'H' the main CPU sends Cmd 0x05 with 0x3d bytes (a settings block).
+ *  - After 'A' the main CPU sends Cmd 0x05 with 0x3d bytes (a settings block).
+ *  - Response registry at runtime (0x80048318, 255 x ptr): 0x01 poll context;
+ *    0x07 cls_105a7a9c (sends 05/1f/06/2f/07, table 0x105a7a3c); '@'..'Z' except
+ *    'E','P' settings manager; 'E','P' cls_105a5cb4; 0x60-0x68 cls_105a7320;
+ *    0x70.. cls_105a7230; 0x80..0xd6 cls_105a7640. A reply whose resp0 has no
+ *    entry is dropped and its requester waits forever.
  *
  *  - Interrupt vector 31 (ICR15, 0x44f; raw handler 0x1049109e -> irq source 0xf)
  *    is handled by the task-5 poll object (vtable 0x105a7ea0, IRQ interface at
@@ -174,6 +179,10 @@ uint8_t k10d_cpucom_rx(FILE *out)
                         st_cur.b[0], st_cur.len - 2, st_cmd);
         } else if (st_cmd == 0x04) {
             st_cur.b[0] = 0x01; st_cur.len = 1;        /* POST: known-good 0x01 then 0xff */
+        } else if (st_cmd == 0x05 || st_cmd == 0x06 || st_cmd == 0x07 || st_cmd == 0x1f || st_cmd == 0x2f) {
+            /* This family (table 0x105a7a3c, class cls_105a7a9c) is registered in the
+             * response registry only under 0x07: its replies must carry resp0 = 0x07. */
+            st_cur.b[0] = 0x07; st_cur.b[1] = 0; st_cur.len = 2;
         } else {
             st_cur.b[0] = (uint8_t)st_cmd; st_cur.b[1] = 0; st_cur.len = 2;   /* echo, no data */
         }
