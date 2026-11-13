@@ -15,6 +15,7 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "k10d_cpucom.h"
 
 #define M32 0xffffffffu
 #define FW_BASE 0x10000000u
@@ -904,7 +905,13 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
              * Cmd:04 POST accepts. */
             uint8_t b;
             uint8_t cmd = (frn_spi_txlen > 0) ? frn_spi_tx[0] : 0xff;
-            if (cmd == 0x01) {
+            /* Companion-CPU model (k10d_cpucom.c) unless a legacy probe is configured. */
+            static int use_model = -1;
+            if (use_model < 0) use_model = k10d_cpucom_enabled() && !getenv("FRN_SPI_INJ")
+                                           && !getenv("FRN_SPI_R01") && !getenv("FRN_SPI_REPLY");
+            if (use_model) {
+                b = k10d_cpucom_rx(frn_tr_out ? frn_tr_out : stderr);
+            } else if (cmd == 0x01) {
                 /* FRN_SPI_INJ=N:hexbytes[;N:hexbytes...] — answer the N-th Cmd:01 poll (1-based)
                  * with this full RX stream instead: a message the DSP originates, routed by its
                  * first byte through the response registry (e.g. 41 09 ... = command 'A'). */
@@ -1014,6 +1021,7 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
         frn_spi_init();
         if (frn_spi_on && frn_spi_txlen < (int)sizeof frn_spi_tx) {
             frn_spi_tx[frn_spi_txlen++] = v & 0xff;
+            k10d_cpucom_tx(v & 0xff);
             if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out ? frn_tr_out : stderr,
                 "[spi] TX byte[%d]=0x%02x pc=0x%08x\n", frn_spi_txlen - 1, v & 0xff, e->pc);
         }
@@ -1090,7 +1098,8 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     if (a == SPI_STATUS) { frn_spi_init(); if (frn_spi_on) {
         if (v & 0x200) { if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
                 "[spi] txn start (status<-0x%04x) reset pos\n", v & 0xffff);
-            frn_spi_pos = 0; frn_spi_txlen = 0; }
+            frn_spi_pos = 0; frn_spi_txlen = 0;
+            k10d_cpucom_txn_start(frn_tr_out ? frn_tr_out : stderr); }
         if (v & 0x100) frn_spi_busy = 1;   /* bit8 start -> transfer in progress */
     } }
     /* DSP black-box: the firmware just wrote a byte to TDR(0x58) = sent a command
@@ -1388,6 +1397,10 @@ static void frn_deliver(CPUFRNState *e)
         lev[n] = cpu_ldub_data(e, 0x440 + (FRN_TMR_VEC - 16)) & 0x1F;
         vec[n] = FRN_TMR_VEC; kind[n] = 3; n++;
     }
+    /* Companion-CPU attention line (k10d_cpucom.c): vector 31, level from ICR15. */
+    static int cpucom_attn = 0;
+    if (!cpucom_attn && k10d_cpucom_enabled() && k10d_cpucom_attention()) cpucom_attn = 1;
+    if (cpucom_attn) { lev[n] = cpu_ldub_data(e, 0x44f) & 0x1F; vec[n] = 31; kind[n] = 4; n++; }
     if (n == 0) return;
     /* insertion sort ascending by level (highest priority = lowest number first) */
     for (int i = 1; i < n; i++) {
@@ -1404,6 +1417,7 @@ static void frn_deliver(CPUFRNState *e)
         if (!(handler >= FW_BASE && handler < FW_END)) continue;
         if (kind[i] == 0) e->pending_valid = 0;  /* DICR stays until FW clears 0x44 */
         if (kind[i] == 2) e->wc_pending = 0;
+        if (kind[i] == 4) cpucom_attn = 0;
         if (kind[i] >= 10 && kind[i] < 30) frn_fire_pending[kind[i] - 10] = 0;
         if (kind[i] >= 30) frn_autotimer_pending[kind[i] - 30] = 0;
         uint32_t saved_ps = pack_ps(e);  /* FR: save pre-trap PS (user S=1) BEFORE entering system mode */
@@ -1415,7 +1429,7 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_tr_irq) {
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
                     "from 0x%08x\n", vec[i],
-                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]>=30?"autotmr":"fire",
+                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]>=30?"autotmr":"fire",
                     handler, lev[i], rd32(e, e->regs[15]));
         }
         return;

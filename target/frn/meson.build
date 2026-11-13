@@ -3,6 +3,7 @@ frn_ss.add(files(
   'cpu.c',
   'gdbstub.c',
   'helper.c',
+  'k10d_cpucom.c',
   'op_helper.c',
   'translate.c',
 ))
