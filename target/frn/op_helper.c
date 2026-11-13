@@ -562,6 +562,36 @@ static void fb_record(uint32_t pc, uint32_t target, int take)
     static uint64_t k; if (++k % 20000000 == 0) fb_dump();
 }
 
+/* --- Per-task position recorder (FRN_TASKS) ------------------------------------
+ * FRN_TASKS=path: tracks the current task (low 16 bits of the word at 0x6a003758 hold
+ * id<<16|prio; we use the id) and, per task, the last PC it executed outside the kernel
+ * (0x1000c000-0x10012000) on its own (user, S=1) stack, plus that moment's rp. At exit (and every 50M instructions)
+ * writes one line per task: id, instructions run, switches in, last PC, rp — where each
+ * task is parked. Kernel addresses: K10D REALOS image layout.                       */
+static int ft_on = -1; static const char *ft_path;
+static uint32_t ft_last_pc[64], ft_last_rp[64]; static uint64_t ft_ins[64], ft_in[64];
+static int ft_cur = -1; static uint64_t ft_n;
+static void ft_dump(void)
+{
+    if (ft_on != 1) return;
+    FILE *f = fopen(ft_path, "w"); if (!f) return;
+    for (int i = 0; i < 64; i++)
+        if (ft_ins[i]) fprintf(f, "task %2d ins=%llu switches_in=%llu last_pc=%08x rp=%08x\n", i,
+                               (unsigned long long)ft_ins[i], (unsigned long long)ft_in[i], ft_last_pc[i], ft_last_rp[i]);
+    fclose(f);
+}
+static inline void ft_step(CPUFRNState *env, uint32_t pc)
+{
+    if (ft_on < 0) { ft_path = getenv("FRN_TASKS"); ft_on = (ft_path && ft_path[0]) ? 1 : 0; if (ft_on) atexit(ft_dump); }
+    if (ft_on != 1) return;
+    int id = (int)((cpu_ldl_be_data(env, 0x6a003758u) >> 16) & 0x3f);
+    if (id != ft_cur) { ft_cur = id; ft_in[id]++; }
+    ft_ins[id]++;
+    /* Task code runs on the user stack (S=1); interrupt handlers on the system stack. */
+    if ((env->sf & 1) && (pc < 0x1000c000u || pc >= 0x10012000u)) { ft_last_pc[id] = pc; ft_last_rp[id] = env->rp; }
+    if (++ft_n % 50000000 == 0) ft_dump();
+}
+
 /* Steer events go into the FRN_FT trace when it is open, so a trace records
  * its own counterfactuals; otherwise to the IRQ-trace stream. */
 static FILE *frn_steer_out(void)
@@ -1512,6 +1542,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
     frn_snapshot(env);
     uint32_t pc = env->pc;
     fa_step(pc, r);
+    ft_step(env, pc);
     frn_hist_tick(pc);
     /* Full execution + memory trace (windowed). */
     frn_ft_init();
