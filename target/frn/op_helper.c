@@ -1098,7 +1098,7 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     frn_ft_mem('W', a, v, 2);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
-    if ((a & 0xffff0000u) == 0x40060000u) {          /* image-processor model */
+    if ((a & 0xffff0000u) == 0x40060000u || (a - 0x40020000u) < 0x2000u || (a - 0x400f0000u) < 0x2000u) {   /* image-processor model */
         k10d_img_env = e;
         k10d_img_write16(a, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
     }
@@ -1127,7 +1127,7 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
                     wr8(e, a + 2, v >> 8); wr8(e, a + 3, v); return; }
     frn_ft_mem('W', a, v, 4);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
-    if ((a & 0xffff0000u) == 0x40060000u) {          /* image-processor model: two halfwords */
+    if ((a & 0xffff0000u) == 0x40060000u || (a - 0x40020000u) < 0x2000u || (a - 0x400f0000u) < 0x2000u) {   /* image-processor model: two halfwords */
         k10d_img_env = e;
         k10d_img_write16(a, v >> 16, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
         k10d_img_write16(a + 2, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
@@ -1391,9 +1391,9 @@ static void frn_autotimer_tick(CPUFRNState *e)
 static void frn_deliver(CPUFRNState *e)
 {
     if (!e->i_flag) return;
-    /* fixed sources: timer, dicr, watch-counter, timer bank, cpucom, imgproc */
-    uint32_t lev[6 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[6 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
-    int kind[6 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
+    /* fixed sources: timer, dicr, watch-counter, timer bank, cpucom, imgproc, 2 x rescon */
+    uint32_t lev[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    int kind[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
     if (e->dicr_pending)  { lev[n] = cpu_ldub_data(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
     if (e->wc_pending)    { lev[n] = cpu_ldub_data(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
@@ -1421,6 +1421,9 @@ static void frn_deliver(CPUFRNState *e)
      * level-triggered while an enabled status bit is pending. */
     if (k10d_img_irq()) {
         lev[n] = cpu_ldub_data(e, 0x453) & 0x1F; vec[n] = 35; kind[n] = 5; n++; }
+    /* Resolution converters (k10d_imgproc.c): vectors 39 / 40, levels ICR23 / ICR24. */
+    for (int u = 0; u < 2; u++)
+        if (k10d_rc_irq(u)) { lev[n] = cpu_ldub_data(e, 0x457 + u) & 0x1F; vec[n] = 39 + u; kind[n] = 6; n++; }
     if (n == 0) return;
     /* insertion sort ascending by level (highest priority = lowest number first) */
     for (int i = 1; i < n; i++) {
@@ -1449,7 +1452,7 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_tr_irq) {
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
                     "from 0x%08x\n", vec[i],
-                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]==5?"imgproc":kind[i]>=30?"autotmr":"fire",
+                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]==5?"imgproc":kind[i]==6?"rescon":kind[i]>=30?"autotmr":"fire",
                     handler, lev[i], rd32(e, e->regs[15]));
         }
         return;
