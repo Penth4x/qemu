@@ -16,6 +16,10 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "k10d_cpucom.h"
+#include "k10d_imgproc.h"
+static CPUFRNState *k10d_img_env;
+static uint32_t k10d_img_ram16(uint32_t a) { return cpu_lduw_be_data(k10d_img_env, a); }
+static uint32_t k10d_img_ram32(uint32_t a) { return cpu_ldl_be_data(k10d_img_env, a); }
 
 #define M32 0xffffffffu
 #define FW_BASE 0x10000000u
@@ -1039,6 +1043,7 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
     frn_ft_mem('R', a, 0, 2);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xffff; }
+    { uint32_t iv; if (k10d_img_read16(a, &iv)) return iv & 0xffff; }   /* image-processor model */
     /* CPUCOM (main<->DSP) SCI status reg at 0x5e: bit2 (0x0004) = TX-complete. The
      * send loop (cpucom_sci_send_byte 0x1043c186) busy-waits while((st & 4)==0);
      * 0x5e is RAM so bit2 never sets -> spin. Report TX-complete so the send
@@ -1079,6 +1084,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
     fa_mem(a);
     frn_rd_hist(a); frn_rd_watch(e, a);
+    { uint32_t iv; if (k10d_img_read32(a, &iv)) return iv; }   /* image-processor model */
     { uint32_t fv; if (frn_force_lookup(a, &fv)) {
         if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, fv);
         return fv; } }
@@ -1092,6 +1098,10 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     frn_ft_mem('W', a, v, 2);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
+    if ((a & 0xffff0000u) == 0x40060000u) {          /* image-processor model */
+        k10d_img_env = e;
+        k10d_img_write16(a, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
+    }
     { int ch = frn_tmr_ch(a); if (ch >= 0) frn_tmr_ctrl_written(e, ch, v & 0xffff); }
     /* CPUCOM SPI black-box: status write with config bit 0x200 = a new transaction
      * is being set up -> reset the per-byte response position. */
@@ -1117,6 +1127,11 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
                     wr8(e, a + 2, v >> 8); wr8(e, a + 3, v); return; }
     frn_ft_mem('W', a, v, 4);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
+    if ((a & 0xffff0000u) == 0x40060000u) {          /* image-processor model: two halfwords */
+        k10d_img_env = e;
+        k10d_img_write16(a, v >> 16, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
+        k10d_img_write16(a + 2, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
+    }
     if (a >= 0x40100000 && a < 0x40101000) {
         frn_lcd_writes++;
         if (a == 0x40100800 && v && !frn_lcd_scanout) {
@@ -1376,8 +1391,9 @@ static void frn_autotimer_tick(CPUFRNState *e)
 static void frn_deliver(CPUFRNState *e)
 {
     if (!e->i_flag) return;
-    uint32_t lev[4 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[4 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
-    int kind[4 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
+    /* fixed sources: timer, dicr, watch-counter, timer bank, cpucom, imgproc */
+    uint32_t lev[6 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[6 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    int kind[6 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
     if (e->dicr_pending)  { lev[n] = cpu_ldub_data(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
     if (e->wc_pending)    { lev[n] = cpu_ldub_data(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
@@ -1401,6 +1417,10 @@ static void frn_deliver(CPUFRNState *e)
     static int cpucom_attn = 0;
     if (!cpucom_attn && k10d_cpucom_enabled() && k10d_cpucom_attention()) cpucom_attn = 1;
     if (cpucom_attn) { lev[n] = cpu_ldub_data(e, 0x44f) & 0x1F; vec[n] = 31; kind[n] = 4; n++; }
+    /* Image-processor operation engine (k10d_imgproc.c): vector 35, level from ICR19,
+     * level-triggered while an enabled status bit is pending. */
+    if (k10d_img_irq()) {
+        lev[n] = cpu_ldub_data(e, 0x453) & 0x1F; vec[n] = 35; kind[n] = 5; n++; }
     if (n == 0) return;
     /* insertion sort ascending by level (highest priority = lowest number first) */
     for (int i = 1; i < n; i++) {
@@ -1429,7 +1449,7 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_tr_irq) {
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
                     "from 0x%08x\n", vec[i],
-                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]>=30?"autotmr":"fire",
+                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]==5?"imgproc":kind[i]>=30?"autotmr":"fire",
                     handler, lev[i], rd32(e, e->regs[15]));
         }
         return;
@@ -1563,6 +1583,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
     uint32_t pc = env->pc;
     fa_step(pc, r);
     ft_step(env, pc);
+    k10d_img_tick();                                  /* image-processor operation timing */
     frn_hist_tick(pc);
     /* Full execution + memory trace (windowed). */
     frn_ft_init();
@@ -1599,6 +1620,20 @@ void HELPER(frn_interp)(CPUFRNState *env)
     /* FRN_LOG_FLG: log the eventflag id (low16 of *(r4)) at wai_flg/set_flg/clr_flg entry,
      * to discover the REAL ids the firmware waits/sets (e.g. what task23 blocks on). */
     { static int lf = -1; if (lf < 0) lf = getenv("FRN_LOG_FLG") ? 1 : 0;
+      /* Mailbox wrappers: mbx_send_message 0x10459864 (r4 = mailbox object, *r4 low16 = id,
+       * r5 = 32-bit message word, r6 = 16-bit tag in its low half) and mbx_receive_message
+       * 0x104598e8 (r4 = mailbox object). */
+      if (lf && (pc == 0x10459864u || pc == 0x104598e8u)) {
+        uint32_t idp = r[4], idw = 0;
+        if ((idp >= 0x80000000u && idp < 0x84000000u) || (idp >= 0x6a000000u && idp < 0x6a100000u))
+            idw = cpu_ldl_be_data(env, idp);
+        if (pc == 0x10459864u)
+            fprintf(frn_tr_out ? frn_tr_out : stderr, "[mbx] send id=0x%04x (obj=0x%08x) msg=0x%08x tag=0x%04x from rp~0x%08x\n",
+                    (idw >> 16) & 0xffff, idp, r[5], r[6] & 0xffff, env->rp);
+        else
+            fprintf(frn_tr_out ? frn_tr_out : stderr, "[mbx] recv id=0x%04x (obj=0x%08x) from rp~0x%08x\n",
+                    (idw >> 16) & 0xffff, idp, env->rp);
+      }
       /* Kernel twai_flg service itself (0x100112a4: r4=flgid, r5=waiptn, r6=wfmode,
        * r7=p_flgptn, timeout on the stack): catches waits that bypass the wrappers. */
       if (lf && pc == 0x100112a4u)
