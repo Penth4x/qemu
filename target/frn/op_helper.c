@@ -400,13 +400,15 @@ static FILE *frn_ft_fp;   /* defined with the FRN_FT tracer below */
  * The summary file is rewritten every FRN_ARGS_EVERY recorded calls (default 1M) and
  * at exit. Line format, one per (function, mode):
  *   <va> <natural|steered> calls=<n> a<i>=<zero>,<small>,<neg>,<rom>,<sdram>,<io>,<other>
- *        :deref=<n>:maxoff=0x<off>:sample=0x<v>   (i = 0..3 for r4..r7)            */
+ *        :deref=<n>:maxoff=0x<off>:sample=0x<v>   (i = 0..3 for r4..r7)
+ *        ret=<r0>,<r1>,<r2>,<r3>  first distinct return addresses (call site = ret-2/-4) */
 #define FA_CLS 7
 #define FA_MAXOFF 0x400u
 #define FA_DEPTH 256
 typedef struct {
     uint32_t va, used, calls[2];
     uint32_t cls[2][4][FA_CLS], deref[2][4], maxoff[2][4], sample[2][4];
+    uint32_t ret[4];   /* first distinct return addresses: the call sites (ret-2 / ret-4) */
 } FaEnt;
 typedef struct { uint32_t ret, sp, a[4]; FaEnt *e; int st; } FaFrame;
 static int fa_on = -1, frn_steered = 0, fa_sp = 0;
@@ -443,7 +445,7 @@ static void fa_dump(void)
                 fprintf(f, ":deref=%u:maxoff=0x%x:sample=0x%08x",
                         e->deref[st][a], e->maxoff[st][a], e->sample[st][a]);
             }
-            fputc('\n', f);
+            fprintf(f, " ret=%08x,%08x,%08x,%08x\n", e->ret[0], e->ret[1], e->ret[2], e->ret[3]);
         }
     }
     fclose(f); rename(tmp, fa_path);
@@ -489,6 +491,10 @@ static inline void fa_step(uint32_t pc, uint32_t *r)
     FaEnt *e = fa_get(pc); if (!e) return;
     int st = frn_steered;
     e->calls[st]++;
+    for (int k = 0; k < 4; k++) {
+        if (e->ret[k] == fa_pending_ret) break;
+        if (!e->ret[k]) { e->ret[k] = fa_pending_ret; break; }
+    }
     if (fa_sp == FA_DEPTH) fa_sp = 0;                /* lost track (task switches): restart */
     FaFrame *fr = &fa_stack[fa_sp++];
     fr->ret = fa_pending_ret; fr->sp = r[15]; fr->e = e; fr->st = st;
@@ -869,6 +875,23 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
             uint8_t b;
             uint8_t cmd = (frn_spi_txlen > 0) ? frn_spi_tx[0] : 0xff;
             if (cmd == 0x01) {
+                /* FRN_SPI_INJ=N:hexbytes — answer the N-th Cmd:01 poll (1-based) with this
+                 * full RX stream instead: a message the DSP originates, routed by its first
+                 * byte through the response registry (e.g. 41 09 ... = command 'A'). */
+                static int inj_n = -1, inj_len = 0, txn = 0; static uint8_t inj[64];
+                if (inj_n < 0) {
+                    inj_n = 0; const char *q = getenv("FRN_SPI_INJ");
+                    if (q) { inj_n = (int)strtol(q, (char **)&q, 0); if (*q == ':') q++;
+                        while (*q && inj_len < 64) { while (*q == ' ' || *q == ',') q++;
+                            char hb[3] = {0}; int k = 0; while (k < 2 && isxdigit((unsigned char)*q)) hb[k++] = *q++;
+                            if (!k) break; inj[inj_len++] = (uint8_t)strtoul(hb, NULL, 16); } }
+                }
+                if (frn_spi_pos == 0) txn++;
+                if (inj_n && txn == inj_n) {
+                    b = (frn_spi_pos < inj_len) ? inj[frn_spi_pos] : 0xff;
+                    if (frn_spi_pos == 0) fprintf(frn_tr_out ? frn_tr_out : stderr,
+                        "[spi] injected DSP message on Cmd:01 poll #%d (resp0=0x%02x, %d bytes)\n", txn, inj[0], inj_len);
+                } else
                 b = (frn_spi_pos < frn_spi_r01_len) ? frn_spi_r01[frn_spi_pos] : 0xff;
             } else {
                 b = (frn_spi_pos < frn_spi_reply_len) ? frn_spi_reply[frn_spi_pos] : 0xff;
