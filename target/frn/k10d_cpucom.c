@@ -21,6 +21,7 @@
  *    'A' (9 bytes) -> screen manager (status LCD); 'H' (0x45) and 'B' (0x17) ->
  *    mode controller ('H' sets flag 0x37 bit 0x80, which the startup task waits
  *    on); 'C', 'I' -> object 0x805329c0; 'X' -> object 0x804a9828.
+ *  - Payload bytes default to 0xff (status bits are active-low; see build_status).
  *  - Until 'A' arrives the main CPU polls ~300 times/s (status byte 3 = 0x10); the
  *    poll payload is a bit-field record of main-CPU state (field table 0x105a78c4:
  *    byte 3 bits 0x01 field 0x0a, 0x10 field 0x0e, 0x20 field 0x0f set by the startup
@@ -43,7 +44,7 @@
  * Behaviour: silent until the Cmd 0x04 POST handshake completes; then raise vector
  * 31 while a status message is pending; deliver it as the
  * reply to the main CPU's Cmd 0x00 (read) or Cmd 0x01 (poll). 'A' first (repeated
- * on polls until the main CPU's poll shows bit 0x20), then each queued boot status
+ * on polls at most twice, or until the main CPU's poll shows bit 0x20), then each queued boot status
  * message once (default 'H', 'B'), then plain echoes. Other commands are acknowledged by echoing the command byte with
  * in_size 0, except Cmd 0x04 (POST), which keeps the long-standing 0x01 ack.
  * Payloads are NOT known: they default to zero bytes and can be set per letter
@@ -68,10 +69,11 @@ static const struct { char c; uint8_t size; } k_sizes[] = {
 static int st_init, st_log, st_acked_a, st_cmd, st_pos;
 static Msg st_cur;                 /* reply being clocked out this transaction */
 static char st_queue[32]; static int st_qn, st_qi;
+static char st_pre[16]; static int st_pn, st_pi;     /* sent after POST, before 'A' */
 static uint8_t st_tx[MAXMSG + 2]; static int st_txlen;
 static uint8_t st_last_status[8]; static int st_last_status_len;
 static FILE *st_out;
-static int st_attn_sent, st_a_sent, st_post_done;  /* POST = Cmd 0x04 handshake */           /* attention edge delivered for the current backlog */
+static int st_attn_sent, st_a_sent, st_post_done, st_a_count;  /* POST = Cmd 0x04 handshake */           /* attention edge delivered for the current backlog */
 
 static int letter_size(char c)
 {
@@ -86,6 +88,11 @@ static void build_status(char c, Msg *m)
     if (n < 0) n = 0;
     memset(m, 0, sizeof *m);
     m->b[0] = (uint8_t)c; m->b[1] = (uint8_t)n; m->len = 2 + n;
+    /* Default payload: all ones. The firmware reads these status bits ACTIVE-LOW
+     * (cls_105a8a1c item test 0x1046b156: an item is asserted when its bit is 0, except
+     * items 0x29/0x2a); all-zero payloads asserted every input at once and drove boot
+     * into a shutdown-like mode transition (0x104329b0(...,3) -> 0x10432a9c parks). */
+    memset(m->b + 2, 0xff, n);
     char var[16]; snprintf(var, sizeof var, "FRN_DSP_%c", c);
     const char *s = getenv(var); int k = 0;
     while (s && *s && k < n) {
@@ -101,8 +108,12 @@ static void init(FILE *out)
 {
     st_init = 1; st_out = out;
     st_log = getenv("FRN_DSP_LOG") != NULL;
+    const char *pq = getenv("FRN_DSP_PRE");
+    for (; pq && *pq && st_pn < (int)sizeof st_pre; pq++)
+        if (letter_size(*pq) >= 0) st_pre[st_pn++] = *pq;
     const char *q = getenv("FRN_DSP_BOOT");
     if (!q) q = "HB";
+    if (!pq) { st_pre[0] = 'X'; st_pn = 1; }   /* default: 'X' before 'A' (startup waits for it, 0xd0004) */
     for (; *q && st_qn < (int)sizeof st_queue; q++)
         if (letter_size(*q) >= 0) st_queue[st_qn++] = *q;
 }
@@ -170,7 +181,11 @@ uint8_t k10d_cpucom_rx(FILE *out)
             /* Cmd 0x00 = the main CPU reading the message we signalled (vector 31);
              * Cmd 0x01 = its status poll. Either carries our next status message. 'A' is
              * repeated on polls until the main CPU acknowledges it (bit 0x20). */
-            if (st_post_done && !st_acked_a && (st_cmd == 0x01 || !st_a_sent)) { build_status('A', &st_cur); st_a_sent = 1; }
+            if (st_post_done && st_pi < st_pn) build_status(st_pre[st_pi++], &st_cur);
+            else if (st_post_done && !st_acked_a && st_a_count < 2 && (st_cmd == 0x01 || !st_a_sent)) {
+                build_status('A', &st_cur); st_a_sent = 1;
+                if (++st_a_count >= 2) st_acked_a = 1;     /* 'A' at most twice (boot needed a second) */
+            }
             else if (st_acked_a && st_qi < st_qn) build_status(st_queue[st_qi++], &st_cur);
             else if (st_cmd == 0x01) {
                 static const uint8_t echo01[] = { 0x01, 0x04, 0xa1, 0xa2, 0xa3, 0xa4 };
