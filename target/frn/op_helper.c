@@ -1623,6 +1623,11 @@ void HELPER(frn_interp)(CPUFRNState *env)
     /* FRN_LOG_FLG: log the eventflag id (low16 of *(r4)) at wai_flg/set_flg/clr_flg entry,
      * to discover the REAL ids the firmware waits/sets (e.g. what task23 blocks on). */
     { static int lf = -1; if (lf < 0) lf = getenv("FRN_LOG_FLG") ? 1 : 0;
+      /* Kernel semaphore services: twai_sem 0x100113dc (r4 = id, r5 = timeout) and
+       * sig_sem 0x10010b38 (r4 = id); rp is the wrapper's caller chain entry. */
+      if (lf && (pc == 0x100113dcu || pc == 0x10010b38u))
+        fprintf(frn_tr_out ? frn_tr_out : stderr, "[sem] %s id=0x%04x tmo=%d rp~0x%08x\n",
+                pc == 0x100113dcu ? "twai" : "sig ", r[4] & 0xffff, pc == 0x100113dcu ? (int)r[5] : 0, env->rp);
       /* Mailbox wrappers: mbx_send_message 0x10459864 (r4 = mailbox object, *r4 low16 = id,
        * r5 = 32-bit message word, r6 = 16-bit tag in its low half) and mbx_receive_message
        * 0x104598e8 (r4 = mailbox object). */

@@ -21,9 +21,11 @@
  *    'A' (9 bytes) -> screen manager (status LCD); 'H' (0x45) and 'B' (0x17) ->
  *    mode controller ('H' sets flag 0x37 bit 0x80, which the startup task waits
  *    on); 'C', 'I' -> object 0x805329c0; 'X' -> object 0x804a9828.
- *  - Until 'A' arrives the main CPU polls ~300 times/s with status byte 3 = 0x10;
- *    the poll after 'A' carries 0x30. So bit 0x20 is the main CPU's "status
- *    received" acknowledgement, and the polling storm is it asking for 'A'.
+ *  - Until 'A' arrives the main CPU polls ~300 times/s (status byte 3 = 0x10); the
+ *    poll payload is a bit-field record of main-CPU state (field table 0x105a78c4:
+ *    byte 3 bits 0x01 field 0x0a, 0x10 field 0x0e, 0x20 field 0x0f set by the startup
+ *    state update 0x10435344). Bit 0x20 is NOT an acknowledgement of 'A' as first
+ *    thought; it is used here only as the point after which 'A' stops repeating.
  *  - After 'A' the main CPU sends Cmd 0x05 with 0x3d bytes (a settings block).
  *  - Response registry at runtime (0x80048318, 255 x ptr): 0x01 poll context;
  *    0x07 cls_105a7a9c (sends 05/1f/06/2f/07, table 0x105a7a3c); '@'..'Z' except
@@ -173,6 +175,18 @@ uint8_t k10d_cpucom_rx(FILE *out)
             else if (st_cmd == 0x01) {
                 static const uint8_t echo01[] = { 0x01, 0x04, 0xa1, 0xa2, 0xa3, 0xa4 };
                 memcpy(st_cur.b, echo01, sizeof echo01); st_cur.len = sizeof echo01;
+                /* Nothing to report: resp0 FRN_DSP_IDLE (default 0x00, an unregistered code,
+                 * which the response dispatcher drops, so the poll chain ends). An echo 0x01
+                 * goes to the poll context, which re-polls at once when no module listens
+                 * (cpucom_ctx_notify_listeners 0x104645e4): an endless storm that keeps the
+                 * CPUCOM task (priority 8, busy-waiting on each transfer) running and starves
+                 * every lower-priority task. INFERRED: the real chip cannot answer that way;
+                 * 0x00 is the simplest reply consistent with the firmware, not an observation.
+                 * With it the screen-manager task resumes and renders. FRN_DSP_IDLE=01 = old echo. */
+                static int idle = -2;
+                if (idle == -2) { const char *e = getenv("FRN_DSP_IDLE"); idle = e ? (int)strtol(e, NULL, 16) : 0x00; }
+                if (idle == 0x01) idle = -1;      /* FRN_DSP_IDLE=01: the old immediate echo */
+                if (idle >= 0 && st_acked_a && st_qi >= st_qn) { st_cur.b[0] = (uint8_t)idle; st_cur.b[1] = 0; st_cur.len = 2; }
             } else { st_cur.b[0] = 0x00; st_cur.b[1] = 0; st_cur.len = 2; }
             if (st_log && st_cur.b[0] > 0x01)
                 fprintf(st_out, "[dsp] status message '%c' (%d bytes) on Cmd:%02x\n",
