@@ -517,6 +517,45 @@ static inline void fa_mem(uint32_t addr)
     }
 }
 
+/* --- Branch-outcome recorder (FRN_BRANCHES) ------------------------------------
+ * FRN_BRANCHES=path: per conditional branch PC, how often it was taken and how often
+ * it fell through, split natural/steered like FRN_ARGS. One line per (pc, mode):
+ *   <pc> <target> <natural|steered> taken=<n> fall=<n>
+ * Rewritten every FRN_ARGS_EVERY calls by fa_dump's cadence and at exit. Used to find
+ * branch sides the firmware never takes (frontier) without a full FRN_FT trace.   */
+typedef struct { uint32_t pc, target, used, n[2][2]; } FbEnt;
+static int fb_on = -1; static const char *fb_path;
+static FbEnt *fb_tab; static uint32_t fb_cap = 1u << 18, fb_used = 0;
+static void fb_dump(void)
+{
+    if (fb_on != 1) return;
+    char tmp[600]; snprintf(tmp, sizeof tmp, "%s.tmp", fb_path);
+    FILE *f = fopen(tmp, "w"); if (!f) return;
+    for (uint32_t i = 0; i < fb_cap; i++) {
+        FbEnt *e = &fb_tab[i]; if (!e->used) continue;
+        for (int st = 0; st < 2; st++)
+            if (e->n[st][0] || e->n[st][1])
+                fprintf(f, "%08x %08x %s taken=%u fall=%u\n", e->pc, e->target,
+                        st ? "steered" : "natural", e->n[st][1], e->n[st][0]);
+    }
+    fclose(f); rename(tmp, fb_path);
+}
+static void fb_record(uint32_t pc, uint32_t target, int take)
+{
+    if (fb_on < 0) {
+        fb_path = getenv("FRN_BRANCHES"); fb_on = (fb_path && fb_path[0]) ? 1 : 0;
+        if (fb_on) { fb_tab = calloc(fb_cap, sizeof(FbEnt)); if (!fb_tab) fb_on = 0; else atexit(fb_dump); }
+    }
+    if (fb_on != 1 || fb_used * 2 >= fb_cap) return;
+    uint32_t h = (pc >> 1) * 2654435761u;
+    for (uint32_t i = 0; i < fb_cap; i++) {
+        FbEnt *e = &fb_tab[(h + i) & (fb_cap - 1)];
+        if (!e->used) { e->used = 1; e->pc = pc; e->target = target; fb_used++; }
+        if (e->pc == pc) { e->n[frn_steered][take ? 1 : 0]++; break; }
+    }
+    static uint64_t k; if (++k % 20000000 == 0) fb_dump();
+}
+
 /* Steer events go into the FRN_FT trace when it is open, so a trace records
  * its own counterfactuals; otherwise to the IRQ-trace stream. */
 static FILE *frn_steer_out(void)
@@ -1774,7 +1813,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
         int32_t disp = (td & 0x80) ? (int32_t)td - 0x100 : (int32_t)td;
         uint32_t target = pc + 2 + disp * 2;
         int take = op_b == 0 || (op_b != 1 && cond(env, op_b));
-        if (op_b >= 2) frn_steer_branch(pc, take, &take);
+        if (op_b >= 2) { frn_steer_branch(pc, take, &take); fb_record(pc, target, take); }
         if (take) {
             if (hi4 == 0xE) env->pc = target;
             else go(env, target, 1);
