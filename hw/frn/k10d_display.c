@@ -14,7 +14,8 @@
  * Buttons: the companion CPU reports them in its 'A' status record, active-low; byte 3
  * (0x01 right, 0x02 left, 0x04 down, 0x08 up, 0x10 OK, 0x80 MENU; up/left confirmed by
  * Andrew on the live window). Keys: arrows, Enter = OK,
- * M = MENU; P = power off (an all-zero 'A' record, which drives the firmware into its
+ * M = MENU, I = INFO (byte 2 0x10), F = Fn (byte 5 0x08), V = playback guess (byte 2 0x20);
+ * P = power off (an all-zero 'A' record, which drives the firmware into its
  * power-off path, where it saves settings to flash; see k10d_flash.c / FRN_FLASH_SAVE).
  * Each change of button state is handed to the companion-CPU model, which queues the
  * message and raises the request interrupt on the CPU thread.
