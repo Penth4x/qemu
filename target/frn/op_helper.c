@@ -306,6 +306,21 @@ static void frn_snapshot(CPUFRNState *e)
         fprintf(stderr, "[frn] SDRAM snapshot %d -> %s (after %ld insns)\n",
                 idx, fn, insns);
     }
+    /* FRN_SNAP_RANGE=hexstart,hexlen: also dump that range to <path>.range.<idx> (e.g. the
+     * display layer buffers near the top of SDRAM, outside the 64 MiB dump above). */
+    {
+        const char *r = getenv("FRN_SNAP_RANGE");
+        if (r) {
+            char *end; uint32_t ra = (uint32_t)strtoul(r, &end, 16);
+            uint32_t rl = (*end == ',') ? (uint32_t)strtoul(end + 1, NULL, 16) : 0x100000;
+            snprintf(fn, sizeof fn, "%s.range.%d", path, idx);
+            f = fopen(fn, "wb");
+            if (f) {
+                for (uint32_t o = 0; o < rl; o++) { uint8_t c = cpu_ldub_data(e, ra + o); fwrite(&c, 1, 1, f); }
+                fclose(f);
+            }
+        }
+    }
     /* also dump WRAM (0x6a000000, 1 MiB): TCBs + RTOS lists live here */
     snprintf(fn, sizeof fn, "%s.wram.%d", path, idx);
     f = fopen(fn, "wb");
