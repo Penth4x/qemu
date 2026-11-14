@@ -200,6 +200,15 @@ static void init(FILE *out)
         if (letter_size(*q) >= 0) st_queue[st_qn++] = *q;
 }
 
+/* 1 while the companion has something to send: boot messages not yet delivered or a timed /
+ * key message queued. Drives its request line (GPIO 0x50000106 bit 0x02), which the vector-31
+ * poll gate (cpucom_request_line_asserted 0x1046614c) reads. */
+int k10d_cpucom_pending(void)
+{
+    if (!st_init) return 1;
+    return !st_post_done || !st_acked_a || st_pi < st_pn || st_qi < st_qn || late_head < late_tail;
+}
+
 int k10d_cpucom_enabled(void)
 {
     static int on = -1;                       /* called every instruction: read the env once */

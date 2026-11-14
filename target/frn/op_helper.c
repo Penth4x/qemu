@@ -794,7 +794,7 @@ static uint8_t frn_spi_tx[64]; static int frn_spi_txlen = 0;
  * not statically known) -> probe via FRN_SPI_R01 (hex bytes, full RX stream incl. the
  * leading ack + in-size). Default: ack=01, in-size=04, payload a1 a2 a3 a4 (probe). */
 static uint8_t frn_spi_r01[64]; static int frn_spi_r01_len = -1;
-static uint8_t frn_hs_reqprev = 0, frn_hs_pendack = 0;  /* 0x50000106 handshake: req edges -> ack pulse */
+static uint8_t frn_hs_reqprev = 0, frn_hs_pendack = 0; static int frn_hs_busy[3];  /* 0x50000106 handshake: req edges -> ack pulse */
 static void frn_spi_init(void)
 {
     if (frn_spi_reply_len >= 0) return;
@@ -931,6 +931,8 @@ static int frn_tmr_irq(CPUFRNState *e)
 
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
+    if (a == 0x5c004023u || a == 0x5c004024u) return 0xffu;      /* serial channel 2 RX (idle bus) */
+
     frn_ft_mem('R', a, 0, 1);
     frn_rd_hist(a);
     frn_rd_watch(e, a);
@@ -953,11 +955,19 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
         if (g) return cpu_ldub_data(e, a) | (uint32_t)g; }
     if (a == 0x50000106u) { frn_spi_init();
         if (frn_spi_on) { uint32_t b = cpu_ldub_data(e, a);
-            /* DSP handshake (code-derived): main drives req bits 0x20/0x40/0x80 and the
-             * cycle is req-up -> wait ack CLEAR, req-down -> wait ack SET. So the DSP ack
-             * (0x01/0x02/0x04) is the INVERSE of the matching req (0x20/0x40/0x80): ack
-             * asserts when the main releases req. ack = (~req) >> 5. */
-            return (b & 0xf8u) | (((~b) >> 5) & 0x07u); } }
+            /* Companion handshake lines (code-derived): the main CPU drives request bits
+             * 0x20/0x40/0x80; the companion answers on 0x01/0x02/0x04. A transfer step is
+             * req up -> wait ack clear, req down -> wait ack set. Line 0x01 is idle clear with a
+             * short busy pulse after request 0x20 falls: the capture task's start-up
+             * (0x10506bc0 -> 0x10466f00, no timeout) waits for 0x01 to be clear, and with the
+             * old inverse-of-request rule it never was. FRN_HS_OLD=1: the old rule for all lines. */
+            static int old = -1; if (old < 0) old = getenv("FRN_HS_OLD") ? 1 : 0;
+            if (old) return (b & 0xf8u) | (((~b) >> 5) & 0x07u);
+            /* Only line 0x01 changes: busy pulse after request 0x20 falls, idle clear.
+             * Lines 0x02/0x04 keep the inverse-of-request rule (boot handshake depends on it). */
+            uint32_t ack = ((~b) >> 5) & 0x06u;
+            if (frn_hs_busy[0] > 0) { ack |= 0x01; frn_hs_busy[0]--; }
+            return (b & 0xf8u) | ack; } }
     if (a == SPI_DATA) { frn_spi_init();
         if (frn_spi_on) {
             /* Select the reply by the captured command byte (frn_spi_tx[0]). Cmd:01 is
@@ -1060,6 +1070,9 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
 
 static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 {
+    if ((a == 0x5c004023u || a == 0x5c004024u)) { static int lg = -1, n; if (lg < 0) lg = getenv("FRN_CH2_LOG") ? 1 : 0;
+        if (lg && n++ < 400) fprintf(stderr, "[ch2] tx 0x%02x (reg %x) pc~0x%08x\n", v & 0xff, a & 0xff, e->pc); }
+
     if ((a - 0x40020000u) < 0x2000u || (a - 0x400f0000u) < 0x2000u) k10d_img_write8(a, v);   /* converter LUT bytes */
     if ((a >> 24) == 0x10 && k10d_flash_write(e, a, v, 1)) { frn_wr_watch(e, a, v); return; }
     frn_ft_mem('W', a, v, 1);
@@ -1076,7 +1089,12 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
         frn_spi_init();
         if (frn_spi_on) { uint8_t nv = v & 0xff;
             uint8_t rising = (uint8_t)(nv & 0xe0) & (uint8_t)~frn_hs_reqprev;
+            uint8_t falling = frn_hs_reqprev & (uint8_t)~(nv & 0xe0);
             frn_hs_pendack |= (uint8_t)((rising >> 5) & 0x07u);
+            for (int k = 0; k < 3; k++) {
+                if (falling & (0x20 << k)) frn_hs_busy[k] = 4;     /* busy pulse after req falls */
+                if (nv & (0x20 << k)) frn_hs_busy[k] = 0;          /* req up: ack clear */
+            }
             frn_hs_reqprev = nv & 0xe0; }
     } else if (a == SPI_DATA) {
         /* CPUCOM TX byte: record it so the per-command responder can see which
@@ -1098,6 +1116,13 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 }
 static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
 {
+    /* Serial channel 2 at 0x5c004020 (same layout as the companion link at 0x5c004040:
+     * +0 control/status, bit 0x100 start, bit 0x800 transfer done; data +3). The capture
+     * task's start-up (0x1041dc02 -> 0x104115ec) talks to a device on it and busy-waits on
+     * bit 0x800 with no timeout. Model: transfers complete at once (device not identified;
+     * received bytes read 0xff). FRN_CH2_LOG=1 logs the bytes sent. */
+    if (a == 0x5c004020u) return cpu_lduw_be_data(e, a) | 0x0800u;
+
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
     frn_ft_mem('R', a, 0, 2);
     frn_rd_hist(a); frn_rd_watch(e, a);

@@ -9,6 +9,7 @@ void    k10d_cpucom_txn_start(FILE *log);    /* status write with bit 0x200 */
 void    k10d_cpucom_tx(uint8_t v);           /* main CPU wrote a data byte */
 uint8_t k10d_cpucom_rx(FILE *log);           /* main CPU reads the simultaneous byte */
 int     k10d_cpucom_attention(void);         /* 1 = raise vector 31 now (edge) */
+int     k10d_cpucom_pending(void);           /* companion request line (message pending) */
 void    k10d_cpucom_tick(void);              /* per instruction: timed messages (FRN_KEYS) */
 
 #endif
