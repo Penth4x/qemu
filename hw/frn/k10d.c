@@ -430,13 +430,15 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         } else {                             /* status/control query: clean, no error bits */
             frn_p67[0x10] = 0; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
         }
-        /* A read command (CMD17/18) has now positioned the card (load_block). Run any read
-         * DMA that was armed before this command, so it reads THIS command's data rather than
-         * the previous command's stale stream position (see frn_dma_d60_start). */
+        /* The command has now positioned the card (load_block for a read / xfer_addr+wr_active
+         * for a write). Run any port DMA that was armed before this command, so it transfers
+         * THIS command's data rather than the previous command's stale position (see
+         * frn_dma_d60_start). */
         { int ri = cmd >> 8;
-          if ((ri == 17 || ri == 18) && current_cpu) {
-              extern void frn_dma_d60_flush_read(CPUFRNState *);
-              frn_dma_d60_flush_read(&FRN_CPU(current_cpu)->env);
+          if (current_cpu) {
+              CPUFRNState *de = &FRN_CPU(current_cpu)->env;
+              if (ri == 17 || ri == 18) { extern void frn_dma_d60_flush_read(CPUFRNState *);  frn_dma_d60_flush_read(de); }
+              if (ri == 24 || ri == 25) { extern void frn_dma_d60_flush_write(CPUFRNState *); frn_dma_d60_flush_write(de); }
           } }
     }
     frn_p67[0x24] = 0x01; frn_p67[0x25] = frn_sd_present_bits();

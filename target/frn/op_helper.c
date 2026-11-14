@@ -1202,9 +1202,10 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v);
  * memory. Model: the copy happens at once in 32-bit units through the normal memory
  * path (so device models see the port accesses); an address inside 0x67000000-0x67000fff
  * is held fixed, others increment; then status = done. */
-/* Pending SD-port read DMA (see frn_dma_d60_start). */
-static int frn_dma_rd_pending;
-static uint32_t frn_dma_rd_dst, frn_dma_rd_n;
+/* Pending SD-port DMA that was armed before its command (see frn_dma_d60_start):
+ * 0 = none, 1 = read (src = port), 2 = write (dst = port). */
+static int frn_dma_pending;
+static uint32_t frn_dma_p_src, frn_dma_p_dst, frn_dma_p_n;
 
 static void frn_dma_d60_xfer(CPUFRNState *e, uint32_t src, uint32_t dst, uint32_t n)
 {
@@ -1224,31 +1225,49 @@ static void frn_dma_d60_xfer(CPUFRNState *e, uint32_t src, uint32_t dst, uint32_
     cpu_stw_be_data(e, 0xd62, 0x0100);
 }
 
-/* Run a read DMA that was deferred until the card was positioned by its CMD17/18.
- * Called from the SDHC command path (hw/frn/k10d.c) after a read command's data is
- * staged. No-op when nothing is pending. */
-void frn_dma_d60_flush_read(CPUFRNState *e)
+/* Run a DMA that was deferred until the card was positioned by its command. Called from the
+ * SDHC command path (hw/frn/k10d.c): flush_read after a CMD17/18, flush_write after a
+ * CMD24/25. No-op unless a pending DMA of the matching direction is held. */
+static void frn_dma_run_pending(CPUFRNState *e)
 {
-    if (!frn_dma_rd_pending) return;
-    frn_dma_rd_pending = 0;
-    frn_dma_d60_xfer(e, 0x67000020, frn_dma_rd_dst, frn_dma_rd_n);
+    extern void k10d_sd_clear_read_fresh(void);
+    extern void k10d_sd_clear_write_fresh(void);
+    int dir = frn_dma_pending;
+    frn_dma_pending = 0;
+    if (dir == 1) k10d_sd_clear_read_fresh(); else if (dir == 2) k10d_sd_clear_write_fresh();
+    frn_dma_d60_xfer(e, frn_dma_p_src, frn_dma_p_dst, frn_dma_p_n);
 }
+void frn_dma_d60_flush_read(CPUFRNState *e)  { if (frn_dma_pending == 1) frn_dma_run_pending(e); }
+void frn_dma_d60_flush_write(CPUFRNState *e) { if (frn_dma_pending == 2) frn_dma_run_pending(e); }
 
 static void frn_dma_d60_start(CPUFRNState *e)
 {
+    extern int k10d_sd_read_cmd_fresh(void);  extern void k10d_sd_clear_read_fresh(void);
+    extern int k10d_sd_write_cmd_fresh(void); extern void k10d_sd_clear_write_fresh(void);
     uint32_t src = cpu_ldl_be_data(e, 0xd68), dst = cpu_ldl_be_data(e, 0xd6c), n = cpu_ldl_be_data(e, 0xd78);
-    int sfix = (src >> 12) == 0x67000;
-    /* A port read DMA is armed BEFORE its CMD17/18 is issued (process_sdhc_transfer_request
-     * 0x10449658 calls invoke_sdhc_buffer_write then sends the command). On hardware the DMA
-     * engine waits for the card's data phase; here it would run synchronously and read the
-     * PREVIOUS command's stale stream position. Defer it until the following CMD17/18
-     * positions the card (frn_dma_d60_flush_read). A still-pending read when a new DMA is
-     * armed is flushed first, against the current card state, as a safety net. */
-    if (frn_dma_rd_pending) frn_dma_d60_flush_read(e);
+    int sfix = (src >> 12) == 0x67000, dfix = (dst >> 12) == 0x67000;
+    /* A still-pending deferred DMA when a new one is armed is flushed first, against the
+     * current card state, as a safety net. */
+    if (frn_dma_pending) frn_dma_run_pending(e);
     cpu_stw_be_data(e, 0xd64, cpu_lduw_be_data(e, 0xd64) & 0x7fff);
+    /* A port DMA must transfer the data of the SD command that positions the card. The
+     * multi-block / RMW transfer engines ARM the DMA before issuing their command
+     * (process_sdhc_transfer_request 0x10449658; write_two_blocks_via_vtable 0x1053e0b0), so
+     * running it now would hit the PREVIOUS command's stale card position - for a read it
+     * copies stale data, for a write it is dropped (no active write command). The single-block
+     * paths issue the command FIRST. Distinguish by whether a command of this direction is
+     * already outstanding (read_cmd_fresh / write_cmd_fresh): run now if so, else defer until
+     * the following command positions the card (frn_dma_d60_flush_read / _write). */
     if (sfix) {
-        frn_dma_rd_pending = 1; frn_dma_rd_dst = dst; frn_dma_rd_n = n;
         cpu_stw_be_data(e, 0xd62, 0x0100);
+        if (k10d_sd_read_cmd_fresh()) { k10d_sd_clear_read_fresh(); frn_dma_d60_xfer(e, src, dst, n); }
+        else { frn_dma_pending = 1; frn_dma_p_src = src; frn_dma_p_dst = dst; frn_dma_p_n = n; }
+        return;
+    }
+    if (dfix) {
+        cpu_stw_be_data(e, 0xd62, 0x0100);
+        if (k10d_sd_write_cmd_fresh()) { k10d_sd_clear_write_fresh(); frn_dma_d60_xfer(e, src, dst, n); }
+        else { frn_dma_pending = 2; frn_dma_p_src = src; frn_dma_p_dst = dst; frn_dma_p_n = n; }
         return;
     }
     frn_dma_d60_xfer(e, src, dst, n);

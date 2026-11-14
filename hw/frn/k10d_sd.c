@@ -27,7 +27,17 @@ static uint8_t buf[512];
 static uint32_t buf_len, buf_pos;
 static int rd_active, rd_multi, wr_active, wr_multi;
 static uint32_t rd_blocks_left;     /* blocks still owed by the current CMD17/18 transfer */
+static int read_cmd_fresh;          /* a CMD17/18 has been issued whose data no DMA has consumed */
+static int write_cmd_fresh;         /* a CMD24/25 has been issued whose data no DMA has supplied */
 static uint64_t xfer_addr;
+
+/* The DMA engine (target/frn/op_helper.c) uses these to tell a command-first transfer (the
+ * command was issued, THEN the DMA armed) from an arm-first one (the DMA armed, THEN the
+ * command): only the latter must be deferred until its command positions the card. */
+int k10d_sd_read_cmd_fresh(void) { return read_cmd_fresh; }
+void k10d_sd_clear_read_fresh(void) { read_cmd_fresh = 0; }
+int k10d_sd_write_cmd_fresh(void) { return write_cmd_fresh; }
+void k10d_sd_clear_write_fresh(void) { write_cmd_fresh = 0; }
 
 static int sd_open(void)
 {
@@ -156,9 +166,11 @@ int k10d_sd_command(uint16_t cmd, uint32_t arg, uint8_t *resp, uint32_t blksize)
               * an oversized DMA. A fresh CMD17/18 is required to read more. count 0
               * falls back to the old unbounded behaviour. */
              rd_blocks_left = idx == 18 ? (k10d_sd_dbg_regs[2] ? k10d_sd_dbg_regs[2] : 0xffffffffu) : 1;
+             read_cmd_fresh = 1;
              load_block(); put_r1(resp, R1); break;
     case 24: case 25:
              xfer_addr = arg; wr_multi = idx == 25; wr_active = 1; rd_active = 0;
+             write_cmd_fresh = 1;
              buf_len = blklen; buf_pos = 0; put_r1(resp, R1); break;
     case 12: rd_active = wr_active = 0; put_r1(resp, R1); break;
     default: put_r1(resp, R1); break;
