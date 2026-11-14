@@ -288,6 +288,16 @@ static const MemoryRegionOps frn_key_ops = {
  * inserted), 0x28-0x33 cleared, then the 0x30 read path below synthesises status.
  */
 static uint8_t frn_p67[0x1000];
+/* Present-state bits 16-23 (+0x25): 16 card inserted, 17 card state stable, 18 card-detect
+ * pin, 19 write-enable pin (1 = writable), 20-23 DAT line levels. No card unless an image is
+ * given (FRN_SD=path); FRN_SD_PRESENT=1 keeps the old "inserted, write-protected, no data"
+ * card. */
+static uint8_t frn_sd_present_bits(void)
+{
+    static int st = -1;
+    if (st < 0) st = getenv("FRN_SD") ? 2 : getenv("FRN_SD_PRESENT") ? 1 : 0;
+    return st == 2 ? 0xff : st == 1 ? 0xf7 : 0xf2;
+}
 
 /* Interrupt status (+0x30) is synthesised in the read path because the write handler
  * clears 0x28-0x33: command-complete / transfer-complete (bits 0-1) toggle on each
@@ -392,7 +402,7 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             frn_p67[0x10] = 0; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
         }
     }
-    frn_p67[0x24] = 0x01; frn_p67[0x25] = 0xf7;
+    frn_p67[0x24] = 0x01; frn_p67[0x25] = frn_sd_present_bits();
     frn_p67[0x26] = 0x0f; frn_p67[0x27] = 0x00;
     for (int b = 0x28; b < 0x34; b++) {
         frn_p67[b] = 0;
@@ -569,8 +579,8 @@ static void k10d_init(MachineState *machine)
     memory_region_init_ram(lowram, NULL, "k10d.lowram", 0x01000000, &error_fatal);
     memory_region_add_subregion(sysmem, 0, lowram);
 
-    /* 0x67000000 SD host controller (SDHCI layout): present state = card inserted. */
-    frn_p67[0x24] = 0x01; frn_p67[0x25] = 0xf7;
+    /* 0x67000000 SD host controller (SDHCI layout): present state from frn_sd_present_bits. */
+    frn_p67[0x24] = 0x01; frn_p67[0x25] = frn_sd_present_bits();
     frn_p67[0x26] = 0x0f; frn_p67[0x27] = 0x00;
     frn_p67[0x2d] |= 0x02;
     MemoryRegion *p67 = g_new(MemoryRegion, 1);
