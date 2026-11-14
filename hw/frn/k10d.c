@@ -222,24 +222,23 @@ static const MemoryRegionOps frn_key_ops = {
 };
 
 /*
- * 0x67000000 body-control peripheral (fremu p67 model): a 0x1000 register file.
- * Reads return the stored bytes (big-endian). Writes store, then force the
- * status/sequencer block to "all ops complete" (instant completion): status
- * 0x24=0x01F70F00, busy block 0x28-0x33 cleared, 0x2c-halfword bit1 (0x2d&0x02)
- * set as the wait-for-set ack. This is the device-ready handshake the boot polls.
+ * 0x67000000 = SD card host controller, standard SDHCI register layout (the firmware's
+ * accessors: +0x04 block size, +0x08 argument, +0x0C transfer mode, +0x0E command
+ * (index<<8 | response flags; 0x0802 CMD8, 0x371a CMD55, 0x2902 ACMD41, 0x333a ACMD51,
+ * 0x061a ACMD6, 0x063a CMD6), +0x10..+0x1C response, +0x20 buffer data port, +0x24
+ * present state, +0x28 host control (bit 1 = 4-bit bus), +0x30 normal interrupt
+ * status (bit 0 command complete, bit 1 transfer complete, bit 5 buffer read ready,
+ * bit 15 error interrupt)). Model: a 0x1000 register file, big-endian. Writes store,
+ * then force "all operations complete": present state 0x24=0x01F70F00 (bit 16 card
+ * inserted), 0x28-0x33 cleared, then the 0x30 read path below synthesises status.
  */
 static uint8_t frn_p67[0x1000];
 
-/*
- * Frame-sync (VSYNC) model. The OSDC overlays graphics onto an external video
- * frame whose vertical sync (VSYNC, a real input pin on the MB91610) arrives
- * ~60 Hz. The K10D's custom 0x67000000 block exposes the frame state at +0x30:
- * bit15 = a frame is available, bit0 = frame parity (toggles each frame so the
- * firmware's "wait for the next frame" edge check advances). Without this the
- * display/menu draw loop never runs. Synthesised in the read path because the
- * write handler clears 0x28-0x33. The parity advances on each poll so a busy
- * wait makes progress; good enough to drive the display pipeline for inspection.
- */
+/* Interrupt status (+0x30) is synthesised in the read path because the write handler
+ * clears 0x28-0x33: command-complete / transfer-complete (bits 0-1) toggle on each
+ * poll so sdhc_wait_int_status catches them, buffer-read-ready (bit 5) is always set,
+ * error interrupt (bit 15) stays clear (an earlier reading of +0x30 as a video
+ * frame-sync register was wrong). */
 /* FRN_P67_371A_DG diagnostic flag: set true while a 0x371a command txn is in flight
  * (see the 0x30 read handler + the 0x0e command-write handler). */
 int frn_p67_371a_dg = 0;
@@ -271,46 +270,29 @@ static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
     if (off <= 0x31 && off + size > 0x30) {
         static uint32_t frame;
         frame++;
-        /* 0x67000030 bit15 (0x8000) = "frame/screen ready". A prior model forced it
-         * ALWAYS set, but the rear-UI draw guard FUN_1044b35e reads exactly this bit
-         * to decide whether to draw the active screen -- and with it forced set, the
-         * draw runs before any screen object exists (screenmgr+0x11c == NULL),
-         * dereferences NULL and derails to pc 0x1c -> reset -> the boot reloop. On
-         * real HW bit15 is 0 until the display pipeline is actually configured. Keep
-         * the toggling parity (bit0) for frame-sync polls; leave bit15 clear unless
-         * FRN_P67_READY forces it back (to compare the old behavior). */
+        /* bit 15 = SDHCI error interrupt: sdhc_error_interrupt_pending FUN_1044b35e
+         * fails every command while it is set. Clear unless FRN_P67_READY forces it. */
         static int ready = -1;
         if (ready < 0) ready = getenv("FRN_P67_READY") ? 0x8000 : 0;
-        /* 0x30 low bits = per-operation "complete" flags the firmware polls: bit0 (pump
-         * FUN_10448a08 &1), bit1 (poll FUN_10448a74 &2), etc. Toggle them together so each
-         * poll catches its bit within its iteration budget. bit15 stays clear (draw guard). */
-        /* bit5 (0x20) = DATA-PORT READY: FUN_104499ca pumps FUN_10448a08(_,0x20,500)
-         * before streaming a command's response block from the 0x20 data port. Without
-         * this the descriptor read (e.g. cmd 0x333a focal/lens descriptor -> screen+0x175,
-         * whose +0x176 nibble gates build_substep_focallen) times out and the focal
-         * picker build halts. Model the data port as always ready. */
+        /* bits 0-1 command/transfer complete (toggled per poll), bit 5 buffer read
+         * ready (sdhc_read_buffer waits for it before reading the data port). */
         uint16_t sync = (uint16_t)ready | 0x0020 | ((frame & 1) ? 0x0003 : 0x0000);
-        /* FRN_P67_371A_DG (diagnostic): assert the draw-guard bit15 while a 0x371a txn
-         * is in flight so build_hw_txn FUN_10447f3e returns 0 for the worker's path-select
-         * 0x371a(0) call -> menu_screen_build_worker takes PATH A (FUN_1044a516, no a2cc)
-         * instead of the a2cc/+0x176 dead-end PATH B. Tests whether path A completes. */
+        /* FRN_P67_371A_DG (diagnostic): raise the error interrupt during CMD55, so the
+         * card does not answer APP_CMD and sd_card_init_worker takes the MMC init table. */
         if (frn_p67_371a_dg) sync |= 0x8000;
         frn_p67[0x30] = sync >> 8;
         frn_p67[0x31] = sync & 0xff;
     }
-    /* 0x67000020 = the body-control DATA PORT (FUN_1044ab58 = *(layout+8)+0x20): the firmware
-     * streams a per-command response block by reading this one register repeatedly (FUN_104499ca).
-     * Each query (cmd 0x63a etc.) expects DIFFERENT real device data here; a single fixed value
-     * satisfies one query's buffer check but breaks another's -> the response-DATA wall. So make
-     * it COMMAND-AWARE: return the value each query's check needs, keyed on the last cmd (0x0e).
-     * cmd 0x63a (sub-step6): buffer word needs bit 0x20000 set, bits24-27 != 0xf -> 0x00020000. */
+    /* 0x67000020 = SDHCI buffer data port: data-transfer commands are read from it word by
+     * word (sdhc_read_buffer FUN_104499ca). The data depends on the command (last write to
+     * +0x0E). CMD6 SWITCH_FUNC (0x063a) status: bit 0x20000 set (function supported),
+     * bits 24-27 != 0xf. */
     if (off == 0x20 && size == 4) {
         uint16_t lastcmd = ((uint16_t)frn_p67[0x0e] << 8) | frn_p67[0x0f];
         if (lastcmd == 0x063a) return 0x00020000u;
-        /* cmd 0x333a (sub-step5 FUN_104485ce): streams the 8-byte focal/lens DESCRIPTOR
-         * into screen+0x175 via FUN_104499ca. Big-endian store puts word byte[23:16] at
-         * +0x176; build_substep_focallen gates on (*(screen+0x176) & 0xf): bit0 (bef0) or
-         * bit2 (bede). Return byte[1]=0x01 so the no-lens focal-picker build proceeds. */
+        /* ACMD51 SEND_SCR (0x333a, sd_acmd51_read_scr FUN_104485ce): the 8-byte SCR.
+         * Byte 1 low nibble = SD_BUS_WIDTHS (bit 0 1-bit, bit 2 4-bit); sd_select_bus_width
+         * fails the card if neither is set. byte 1 = 0x01: a 1-bit-only card. */
         if (lastcmd == 0x333a) return 0x00010000u;
     }
     uint64_t v = 0;
@@ -327,21 +309,14 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     for (unsigned i = 0; i < size; i++) {
         frn_p67[(off + size - 1 - i) & 0xfff] = (val >> (8 * i)) & 0xff;
     }
-    /* p67 command/response: the rear-UI build issues HW query transactions via this
-     * block -- data -> 0x08, command -> 0x0e, response read back <- 0x10..0x1c (which
-     * the firmware copies to screen+0x3b4..). The real device, on a command write to
-     * 0x0e, produces a response ECHOING the 0x08 data (incl the 0xaa ping marker that
-     * build_hw_query/p67_query_check validate as (resp&0xff)==0xaa / bit7 set). Without
-     * this the response regs read 0 -> build sub-steps time out -> menu never builds. */
+    /* SD command response. Writing the command register (+0x0E) issues the command whose
+     * argument is at +0x08; the response lands in +0x10..+0x1C (sdhc_latch_response copies
+     * it to host+0x3b4..). Per command (index = high byte):
+     *  - CMD8  SEND_IF_COND 0x0802: R7 echoes the argument (check pattern 0xAA).
+     *  - ACMD41 0x2902: OCR, bit 31 (byte 0 bit 7) = card power-up done.
+     *  - CMD1 (MMC) 0x0102: OCR, same busy bit.
+     *  - everything else: R1 card status with no error bits (mask 0xfdf90008). */
     if (off <= 0x0e && off + size > 0x0e) {       /* a command was written to 0x0e */
-        /* Per-command response. The response word (0x10..0x13, big-endian) is checked
-         * differently per command, and byte[0] bit7 means OPPOSITE things:
-         *  - ping   0x802  : build_hw_query wants low byte (0x13) == 0xaa (marker echo).
-         *  - query  0x2902 : p67_query_check wants byte[0] bit7 SET ("valid data").
-         *  - status 0x700/0x71b : FUN_1044810e wants (resp & 0xfdf90008)==0 (no error bits;
-         *                 byte[0] bit7 is an ERROR flag here -> must be CLEAR).
-         * So branch on the command: ping -> echo the data; data-query -> valid+clean;
-         * everything else (status/control) -> clean (no error bits). */
         uint16_t cmd = ((uint16_t)frn_p67[0x0e] << 8) | frn_p67[0x0f];
         /* FRN_P67_371A_DG: mark a 0x371a txn in-flight so the 0x30 read asserts the
          * draw-guard bit15 -> build_hw_txn returns 0 -> worker takes build PATH A. */
@@ -350,13 +325,11 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (cmd == 0x0802) {                 /* ping: echo the 0x08 data (0xaa marker) */
             frn_p67[0x10] = frn_p67[0x08]; frn_p67[0x11] = frn_p67[0x09];
             frn_p67[0x12] = frn_p67[0x0a]; frn_p67[0x13] = frn_p67[0x0b];
-        } else if (cmd == 0x2902) {          /* data query: byte[0] bit7 = valid */
+        } else if (cmd == 0x2902) {          /* ACMD41: OCR power-up done */
             frn_p67[0x10] = 0x80; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
         } else if (cmd == 0x0102) {
-            /* body-mode/status query (path A FUN_10448640 -> screen+0x190, polled by
-             * FUN_1044a5a0 until byte[0] bit7 "ready" set; bits5,6 = 2-bit body mode).
-             * Return ready(bit7) so the poll completes. Mode bits in 5,6 selectable via
-             * FRN_P67_BODYMODE (0..3; default 0). NOT error-checked for this cmd. */
+            /* CMD1 (MMC init table): OCR with bit 31 power-up done; bits 30:29 (byte 0
+             * bits 6:5) = access mode, selectable via FRN_P67_BODYMODE (0..3, default 0). */
             static int bm = -2; if (bm == -2) { const char *e = getenv("FRN_P67_BODYMODE"); bm = e ? atoi(e) : 0; }
             uint8_t b0 = 0x80 | ((bm & 2) ? 0x40 : 0) | ((bm & 1) ? 0x20 : 0);
             frn_p67[0x10] = b0; frn_p67[0x11] = 0; frn_p67[0x12] = 0; frn_p67[0x13] = 0;
@@ -541,12 +514,12 @@ static void k10d_init(MachineState *machine)
     memory_region_init_ram(lowram, NULL, "k10d.lowram", 0x01000000, &error_fatal);
     memory_region_add_subregion(sysmem, 0, lowram);
 
-    /* 0x67000000 body-control peripheral (stateful handshake). */
+    /* 0x67000000 SD host controller (SDHCI layout): present state = card inserted. */
     frn_p67[0x24] = 0x01; frn_p67[0x25] = 0xf7;
     frn_p67[0x26] = 0x0f; frn_p67[0x27] = 0x00;
     frn_p67[0x2d] |= 0x02;
     MemoryRegion *p67 = g_new(MemoryRegion, 1);
-    memory_region_init_io(p67, NULL, &frn_p67_ops, NULL, "frn.bodyctl", 0x1000);
+    memory_region_init_io(p67, NULL, &frn_p67_ops, NULL, "frn.sdhc", 0x1000);
     memory_region_add_subregion(sysmem, 0x67000000, p67);
 
     /* Watch-counter / RTC (clock-unset first-boot state) at 0x40090000. */
