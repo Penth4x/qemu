@@ -18,6 +18,35 @@
 #include "k10d_cpucom.h"
 #include "k10d_flash.h"
 #include "k10d_imgproc.h"
+
+/* Direct host access to the board's plain-RAM regions (hw/frn/k10d.c sets these). The
+ * interpreter runs every guest instruction through helpers, and QEMU's softmmu lookup for
+ * each fetch and load was the dominant cost. Only ROM (0x10000000, 16 MiB), SDRAM
+ * (0x80000000, 256 MiB) and work RAM (0x6a000000, 1 MiB) use this; all device models and
+ * debug hooks still run before the load. */
+extern uint8_t *k10d_host_lowram, *k10d_host_rom, *k10d_host_sdram, *k10d_host_wram;
+static inline const uint8_t *frn_host(uint32_t a, unsigned n)
+{
+    if (a - 0x80000000u <= 0x10000000u - n) return k10d_host_sdram ? k10d_host_sdram + (a - 0x80000000u) : NULL;
+    if (a - 0x10000000u <= 0x01000000u - n) return k10d_host_rom ? k10d_host_rom + (a - 0x10000000u) : NULL;
+    if (a - 0x6a000000u <= 0x00100000u - n) return k10d_host_wram ? k10d_host_wram + (a - 0x6a000000u) : NULL;
+    return NULL;
+}
+static inline uint32_t frn_ld16(CPUFRNState *e, uint32_t a)
+{
+    const uint8_t *h = frn_host(a, 2);
+    return h ? (uint32_t)(h[0] << 8 | h[1]) : cpu_lduw_be_data(e, a);
+}
+static inline uint32_t frn_ld32(CPUFRNState *e, uint32_t a)
+{
+    const uint8_t *h = frn_host(a, 4);
+    return h ? ((uint32_t)h[0] << 24 | h[1] << 16 | h[2] << 8 | h[3]) : cpu_ldl_be_data(e, a);
+}
+/* Low-RAM control registers read every instruction (timer 0x4e/0x4f, ICR 0x440-0x47f). */
+static inline uint32_t frn_icr(CPUFRNState *e, uint32_t a)
+{
+    return k10d_host_lowram ? k10d_host_lowram[a] : cpu_ldub_data(e, a);
+}
 static CPUFRNState *k10d_img_env;
 static uint32_t k10d_img_ram16(uint32_t a) { return cpu_lduw_be_data(k10d_img_env, a); }
 static uint32_t k10d_img_ram32(uint32_t a) { return cpu_ldl_be_data(k10d_img_env, a); }
@@ -1104,7 +1133,7 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
             if (getenv("FRN_DSP_LOG")) fprintf(frn_tr_out?frn_tr_out:stderr,
                 "[dsp-reply] RDR read -> byte 0x%02x (%d/%d) pc=0x%08x\n", b, frn_dsp_pos, frn_dsp_reply_len, e->pc);
             return b; } }
-    { uint32_t r = cpu_lduw_be_data(e, a); frn_rbw_check(e, a, 2, r); return r; }
+    { uint32_t r = frn_ld16(e, a); frn_rbw_check(e, a, 2, r); return r; }
 }
 static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 {
@@ -1116,7 +1145,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
     { uint32_t fv; if (frn_force_lookup(a, &fv)) {
         if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, fv);
         return fv; } }
-    { uint32_t r = cpu_ldl_be_data(e, a); frn_rbw_check(e, a, 4, r);
+    { uint32_t r = frn_ld32(e, a); frn_rbw_check(e, a, 4, r);
       if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, r);
       return r; }
 }
@@ -1321,13 +1350,13 @@ static void frn_timer_tick(CPUFRNState *e)
     e->tmr_div++;
     if (e->tmr_div < 1) return;        /* TIMER_STEPS_PER_TICK = 1 */
     e->tmr_div = 0;
-    uint32_t csr = (cpu_ldub_data(e, 0x4E) << 8) | cpu_ldub_data(e, 0x4F);
+    uint32_t csr = (frn_icr(e, 0x4E) << 8) | frn_icr(e, 0x4F);
     int inte = (csr >> 3) & 1, reld = (csr >> 4) & 1;
     if (e->tmr_count == 0) {
-        cpu_stb_data(e, 0x4F, cpu_ldub_data(e, 0x4F) | 0x04);   /* UF, raw */
+        cpu_stb_data(e, 0x4F, frn_icr(e, 0x4F) | 0x04);   /* UF, raw */
         if (inte && !e->pending_valid) {
             e->pending_vec = TIMER_VECTOR;
-            e->pending_level = cpu_ldub_data(e, TIMER_ICR) & 0x1F;
+            e->pending_level = frn_icr(e, TIMER_ICR) & 0x1F;
             e->pending_valid = 1;
         }
         e->tmr_count = reld ? e->tmr_reload : 0xFFFF;
@@ -1343,7 +1372,7 @@ static void frn_timer_tick(CPUFRNState *e)
  * frn_deliver, so a masked ICR25 simply never fires. */
 static void frn_watch_tick(CPUFRNState *e)
 {
-    uint32_t icr = cpu_ldub_data(e, WC_ICR) & 0x1F;
+    uint32_t icr = frn_icr(e, WC_ICR) & 0x1F;
     if (icr == 0x1F) return;              /* not enabled by firmware yet */
     if (++e->wc_div < WC_PERIOD) return;
     e->wc_div = 0;
@@ -1374,7 +1403,7 @@ static void frn_fire_tick(CPUFRNState *e)
         }
     }
     for (int i = 0; i < frn_fire_n; i++) {
-        uint32_t icr = cpu_ldub_data(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
+        uint32_t icr = frn_icr(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
         if (icr == 0x1F) continue;            /* not enabled yet */
         if (++frn_fire_div[i] < (uint32_t)frn_fire_period) continue;
         frn_fire_div[i] = 0;
@@ -1411,7 +1440,7 @@ static void frn_autotimer_tick(CPUFRNState *e)
     }
     if (frn_autotimer_period <= 0) return;
     for (int i = 0; i < FRN_AUTOTIMER_N; i++) {
-        uint32_t icr = cpu_ldub_data(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
+        uint32_t icr = frn_icr(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
         if (icr == 0x1F) continue;                 /* not unmasked by firmware */
         if (++frn_autotimer_div[i] < (uint32_t)frn_autotimer_period) continue;
         frn_autotimer_div[i] = 0;
@@ -1423,38 +1452,41 @@ static void frn_deliver(CPUFRNState *e)
 {
     if (!e->i_flag) return;
     /* fixed sources: timer, dicr, watch-counter, timer bank, cpucom, imgproc, 2 x rescon */
-    uint32_t lev[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
-    int kind[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], n = 0;
+    /* static: QEMU builds with -ftrivial-auto-var-init=zero, which zero-filled these locals on
+     * every instruction (75% of this function's time). One vCPU thread uses them. */
+    static uint32_t lev[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    static int kind[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    int n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
-    if (e->dicr_pending)  { lev[n] = cpu_ldub_data(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
-    if (e->wc_pending)    { lev[n] = cpu_ldub_data(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
+    if (e->dicr_pending)  { lev[n] = frn_icr(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
+    if (e->wc_pending)    { lev[n] = frn_icr(e, WC_ICR) & 0x1F; vec[n] = WC_VECTOR; kind[n] = 2; n++; }
     for (int i = 0; i < frn_fire_n; i++) {
         if (frn_fire_pending[i]) {
-            lev[n] = cpu_ldub_data(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
+            lev[n] = frn_icr(e, 0x440 + (frn_fire_vec[i] - 16)) & 0x1F;
             vec[n] = frn_fire_vec[i]; kind[n] = 10 + i; n++;
         }
     }
     for (int i = 0; i < FRN_AUTOTIMER_N; i++) {
         if (frn_autotimer_pending[i]) {
-            lev[n] = cpu_ldub_data(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
+            lev[n] = frn_icr(e, 0x440 + (frn_autotimer_vec[i] - 16)) & 0x1F;
             vec[n] = frn_autotimer_vec[i]; kind[n] = 30 + i; n++;
         }
     }
     if (frn_tmr_irq(e)) {
-        lev[n] = cpu_ldub_data(e, 0x440 + (FRN_TMR_VEC - 16)) & 0x1F;
+        lev[n] = frn_icr(e, 0x440 + (FRN_TMR_VEC - 16)) & 0x1F;
         vec[n] = FRN_TMR_VEC; kind[n] = 3; n++;
     }
     /* Companion-CPU attention line (k10d_cpucom.c): vector 31, level from ICR15. */
     static int cpucom_attn = 0;
     if (!cpucom_attn && k10d_cpucom_enabled() && k10d_cpucom_attention()) cpucom_attn = 1;
-    if (cpucom_attn) { lev[n] = cpu_ldub_data(e, 0x44f) & 0x1F; vec[n] = 31; kind[n] = 4; n++; }
+    if (cpucom_attn) { lev[n] = frn_icr(e, 0x44f) & 0x1F; vec[n] = 31; kind[n] = 4; n++; }
     /* Image-processor operation engine (k10d_imgproc.c): vector 35, level from ICR19,
      * level-triggered while an enabled status bit is pending. */
     if (k10d_img_irq()) {
-        lev[n] = cpu_ldub_data(e, 0x453) & 0x1F; vec[n] = 35; kind[n] = 5; n++; }
+        lev[n] = frn_icr(e, 0x453) & 0x1F; vec[n] = 35; kind[n] = 5; n++; }
     /* Resolution converters (k10d_imgproc.c): vectors 39 / 40, levels ICR23 / ICR24. */
     for (int u = 0; u < 2; u++)
-        if (k10d_rc_irq(u)) { lev[n] = cpu_ldub_data(e, 0x457 + u) & 0x1F; vec[n] = 39 + u; kind[n] = 6; n++; }
+        if (k10d_rc_irq(u)) { lev[n] = frn_icr(e, 0x457 + u) & 0x1F; vec[n] = 39 + u; kind[n] = 6; n++; }
     if (n == 0) return;
     /* insertion sort ascending by level (highest priority = lowest number first) */
     for (int i = 1; i < n; i++) {
@@ -1598,7 +1630,7 @@ static void frn_poke_tick(CPUFRNState *e)
             fires,n,sz,pa[0],pv[0]);
 }
 
-void HELPER(frn_interp)(CPUFRNState *env)
+static void frn_interp_one(CPUFRNState *env)
 {
     uint32_t *r = env->regs;
     if (!frn_tr_ready) {
@@ -1872,7 +1904,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
             fprintf(frn_tr_out, "\n");
         }
     }
-    uint32_t w = rd16(env, pc);
+    uint32_t w = frn_host(pc, 2) ? frn_ld16(env, pc) : rd16(env, pc);   /* fetch: RAM fast path */
     uint32_t pending = env->delay_armed ? env->delay_pc : 0xffffffffu;
     int had_pending = env->delay_armed;
     env->delay_armed = 0;
@@ -2190,4 +2222,16 @@ void HELPER(frn_interp)(CPUFRNState *env)
     if (had_pending) {
         env->pc = pending;
     }
+}
+
+/* QEMU entry: one translation block = one call, which interprets a batch of guest
+ * instructions (FRN_BATCH, default 64; 1 = the old one-instruction-per-block behaviour).
+ * Every instruction still runs all per-instruction hooks (timers, interrupt delivery,
+ * traces); batching only removes QEMU's block dispatch between instructions, which cost
+ * about as much as the interpretation itself. QEMU regains control after each batch. */
+void HELPER(frn_interp)(CPUFRNState *env)
+{
+    static int batch = -1;
+    if (batch < 0) { const char *b = getenv("FRN_BATCH"); batch = b ? atoi(b) : 64; if (batch < 1) batch = 1; }
+    for (int i = 0; i < batch; i++) frn_interp_one(env);
 }

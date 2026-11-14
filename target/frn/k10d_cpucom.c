@@ -197,8 +197,9 @@ static void init(FILE *out)
 
 int k10d_cpucom_enabled(void)
 {
-    const char *s = getenv("FRN_DSP_MODEL");
-    return !(s && s[0] == '0');
+    static int on = -1;                       /* called every instruction: read the env once */
+    if (on < 0) { const char *s = getenv("FRN_DSP_MODEL"); on = !(s && s[0] == '0'); }
+    return on;
 }
 
 void k10d_cpucom_txn_start(FILE *out)

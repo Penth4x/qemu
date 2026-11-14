@@ -19,6 +19,7 @@
 #include "qemu/timer.h"
 #include "cpu.h"
 #include "k10d_display.h"
+uint8_t *k10d_host_lowram, *k10d_host_rom, *k10d_host_sdram, *k10d_host_wram;
 
 /*
  * Background MMIO: everything that is not RAM/ROM reads as 0xffffffff and
@@ -613,6 +614,13 @@ static void k10d_init(MachineState *machine)
 
     /* Rear display window + buttons (-display gtk/sdl/vnc; inert with -display none). */
     k10d_display_init();
+
+    /* Host pointers for the interpreter's fast paths (target/frn/op_helper.c): plain RAM
+     * regions with no device overlays inside them. */
+    k10d_host_lowram = memory_region_get_ram_ptr(lowram);
+    k10d_host_rom = memory_region_get_ram_ptr(rom);
+    k10d_host_sdram = memory_region_get_ram_ptr(sdram);
+    k10d_host_wram = memory_region_get_ram_ptr(wram);
 
     cpu->env.pc = K10D_ENTRY;
     cpu->env.regs[15] = K10D_SP;
