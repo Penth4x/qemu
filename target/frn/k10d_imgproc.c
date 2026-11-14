@@ -22,7 +22,7 @@
  * Model: a start (bit 14 written) completes after FRN_IMG_LATENCY instructions (default
  * 20000): status |= the engine's bit, its bit 14 cleared. Vector 35 is requested while (status & enable &
  * 0x2c) != 0. Status is write-1-to-clear. The operation itself is not performed (its
- * semantics are not established). Registers 0x40060000-0x400601ff are kept in a register
+ * semantics are not established), except engine A's rectangle fill (mode 0x700). Registers 0x40060000-0x400601ff are kept in a register
  * file (unwritten halfwords read 0xffff as before). FRN_IMG_LOG=1 logs each start with its parameters.
  * FRN_IMG_MODEL=0 disables (registers stay plain RAM, as before).
  */
@@ -44,6 +44,8 @@ static const struct { uint32_t ctrl; uint16_t bit; char name; } eng[3] = {
 };
 static long countdown[3] = { -1, -1, -1 };
 static FILE *out;
+static void (*st8)(uint32_t, uint8_t);
+void k10d_img_set_store(void (*f)(uint32_t, uint8_t)) { st8 = f; }
 /* Register file for 0x40060000-0x400601ff: the emulator's unbacked I/O space reads 0xffff
  * and drops writes, which broke the firmware's read-modify-write of these registers.
  * Halfwords never written keep reading the old default (0xffff). */
@@ -132,6 +134,18 @@ int k10d_img_write16(uint32_t a, uint32_t v, FILE *log, uint32_t (*ram16)(uint32
     for (int k = 0; k < 3; k++) {
         if (a != eng[k].ctrl || !(v & 0x4000)) continue;
         countdown[k] = latency;
+        /* Engine A, mode 0x700 = rectangle fill with the low byte of the control word:
+         * destination +0x98, destination stride +0x8e, width +0x90, height +0x92 (bytes /
+         * rows). The firmware clears each display back buffer this way before a redraw
+         * (Y = 0x00, Cb/Cr = 0x80, alpha plane = 0x00). */
+        if (k == 0 && (v & 0x0f00) == 0x0700 && st8) {
+            uint32_t dst = 0x80000000u | (r32(IMG_BASE + 0x98) & 0x3fffffffu);
+            uint32_t stride = r16(IMG_BASE + 0x8e) & 0x1ff0, w = r16(IMG_BASE + 0x90) & 0x1fff,
+                     h = r16(IMG_BASE + 0x92) & 0xfff;
+            if (stride && w && h && w <= stride)
+                for (uint32_t y = 0; y < h; y++)
+                    for (uint32_t x = 0; x < w; x++) st8(dst + y * stride + x, v & 0xff);
+        }
         if (log_on && k == 0)
             fprintf(out, "[img] start A ctrl=%04x f82=%04x w84=%08x w88=%08x stride %04x/%04x "
                          "size %04x/%04x addr %08x -> %08x opt=%04x ien=%04x\n",

@@ -138,12 +138,42 @@ static void parse_late(void)
     }
 }
 
+/* Interactive buttons (hw/frn/k10d_display.c, main-loop thread): an 'A' record to send
+ * now. Handed over through a small ring read by k10d_cpucom_tick on the CPU thread. */
+#define KEY_RING 16
+static uint8_t key_ring[KEY_RING][9];
+static volatile unsigned key_w, key_r;
+void k10d_cpucom_post_key_record(const uint8_t *payload9);
+void k10d_cpucom_post_key_record(const uint8_t *payload9)
+{
+    unsigned w = key_w;
+    if (w - key_r >= KEY_RING) return;
+    memcpy(key_ring[w % KEY_RING], payload9, 9);
+    __atomic_store_n(&key_w, w + 1, __ATOMIC_RELEASE);
+}
+
 void k10d_cpucom_tick(void)
 {
     st_insns++;
+    /* Button records are released at least KEY_GAP instructions apart: the firmware does not
+     * register a release that follows its press by less than ~4-5M instructions (measured: a
+     * 3M hold leaves the key "held" and the next press is ignored; 5M works). This emulator
+     * runs a few M instructions per second, so a short real key tap needs this stretch.
+     * FRN_KEY_GAP=<M insns> overrides (default 6). */
+    static uint64_t key_last;
+    static long key_gap = -1;
+    if (key_gap < 0) { const char *g = getenv("FRN_KEY_GAP"); key_gap = g ? strtol(g, NULL, 0) * 1000000L : 6000000L; }
+    if (key_r != __atomic_load_n(&key_w, __ATOMIC_ACQUIRE) && late_tail - late_head < LATE_MAX
+        && (key_last == 0 || st_insns - key_last >= (uint64_t)key_gap)) {
+        Msg m; build_status('A', &m);
+        memcpy(m.b + 2, key_ring[key_r % KEY_RING], 9);
+        late_due[late_tail++ % LATE_MAX] = m;
+        key_r++; key_last = st_insns;
+        st_attn_sent = 0;
+    }
     while (late_next < late_n && st_insns >= late[late_next].at && late_tail - late_head < LATE_MAX) {
         late_due[late_tail++ % LATE_MAX] = late[late_next].m;
-        if (st_log || 1) fprintf(st_out ? st_out : stderr, "[dsp] key/status message '%c' due at %llu insns\n",
+        if (st_log) fprintf(st_out ? st_out : stderr, "[dsp] key/status message '%c' due at %llu insns\n",
                                  late[late_next].m.b[0], (unsigned long long)st_insns);
         late_next++;
         st_attn_sent = 0;

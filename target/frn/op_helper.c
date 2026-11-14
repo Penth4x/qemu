@@ -21,6 +21,7 @@
 static CPUFRNState *k10d_img_env;
 static uint32_t k10d_img_ram16(uint32_t a) { return cpu_lduw_be_data(k10d_img_env, a); }
 static uint32_t k10d_img_ram32(uint32_t a) { return cpu_ldl_be_data(k10d_img_env, a); }
+static void k10d_img_st8(uint32_t a, uint8_t v) { cpu_stb_data(k10d_img_env, a, v); }
 
 #define M32 0xffffffffu
 #define FW_BASE 0x10000000u
@@ -1127,7 +1128,7 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
     if ((a & 0xffff0000u) == 0x40060000u || (a - 0x40020000u) < 0x2000u || (a - 0x400f0000u) < 0x2000u) {   /* image-processor model */
-        k10d_img_env = e;
+        k10d_img_env = e; k10d_img_set_store(k10d_img_st8);
         k10d_img_write16(a, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
     }
     { int ch = frn_tmr_ch(a); if (ch >= 0) frn_tmr_ctrl_written(e, ch, v & 0xffff); }
@@ -1158,7 +1159,7 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
     frn_ft_mem('W', a, v, 4);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     if ((a & 0xffff0000u) == 0x40060000u || (a - 0x40020000u) < 0x2000u || (a - 0x400f0000u) < 0x2000u) {   /* image-processor model: two halfwords */
-        k10d_img_env = e;
+        k10d_img_env = e; k10d_img_set_store(k10d_img_st8);
         k10d_img_write16(a, v >> 16, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
         k10d_img_write16(a + 2, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
     }

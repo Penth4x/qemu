@@ -18,6 +18,7 @@
 #include "system/memory.h"
 #include "qemu/timer.h"
 #include "cpu.h"
+#include "k10d_display.h"
 
 /*
  * Background MMIO: everything that is not RAM/ROM reads as 0xffffffff and
@@ -609,6 +610,9 @@ static void k10d_init(MachineState *machine)
         error_report("k10d: could not load firmware '%s'", machine->firmware);
         exit(1);
     }
+
+    /* Rear display window + buttons (-display gtk/sdl/vnc; inert with -display none). */
+    k10d_display_init();
 
     cpu->env.pc = K10D_ENTRY;
     cpu->env.regs[15] = K10D_SP;
