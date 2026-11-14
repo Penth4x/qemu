@@ -1202,17 +1202,56 @@ static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v);
  * memory. Model: the copy happens at once in 32-bit units through the normal memory
  * path (so device models see the port accesses); an address inside 0x67000000-0x67000fff
  * is held fixed, others increment; then status = done. */
-static void frn_dma_d60_start(CPUFRNState *e)
+/* Pending SD-port read DMA (see frn_dma_d60_start). */
+static int frn_dma_rd_pending;
+static uint32_t frn_dma_rd_dst, frn_dma_rd_n;
+
+static void frn_dma_d60_xfer(CPUFRNState *e, uint32_t src, uint32_t dst, uint32_t n)
 {
-    uint32_t src = cpu_ldl_be_data(e, 0xd68), dst = cpu_ldl_be_data(e, 0xd6c), n = cpu_ldl_be_data(e, 0xd78);
     int sfix = (src >> 12) == 0x67000, dfix = (dst >> 12) == 0x67000;
     static int lg = -1; if (lg < 0) lg = getenv("FRN_DMA_LOG") ? 1 : 0;
     if (lg) fprintf(stderr, "[dma d60] 0x%08x -> 0x%08x  %u bytes\n", src, dst, n);
+    { static int pc = -1; if (pc < 0) pc = getenv("FRN_DMA_PC") ? 1 : 0;
+      if (pc) { fprintf(stderr, "[dma d60]   pc 0x%08x rp 0x%08x stack:", e->pc, e->rp);
+          for (int k = 0; k < 160; k++) {
+              uint32_t sv = cpu_ldl_be_data(e, e->regs[15] + k*4);
+              if (sv >= 0x10000000u && sv < 0x11000000u) fprintf(stderr, " 0x%08x", sv);
+          }
+          fprintf(stderr, "\n"); } }
     if (n > 0x1000000) n = 0;
     for (uint32_t i = 0; i < n; i += 4)
         wr32(e, dfix ? dst : dst + i, rd32(e, sfix ? src : src + i));
     cpu_stw_be_data(e, 0xd62, 0x0100);
+}
+
+/* Run a read DMA that was deferred until the card was positioned by its CMD17/18.
+ * Called from the SDHC command path (hw/frn/k10d.c) after a read command's data is
+ * staged. No-op when nothing is pending. */
+void frn_dma_d60_flush_read(CPUFRNState *e)
+{
+    if (!frn_dma_rd_pending) return;
+    frn_dma_rd_pending = 0;
+    frn_dma_d60_xfer(e, 0x67000020, frn_dma_rd_dst, frn_dma_rd_n);
+}
+
+static void frn_dma_d60_start(CPUFRNState *e)
+{
+    uint32_t src = cpu_ldl_be_data(e, 0xd68), dst = cpu_ldl_be_data(e, 0xd6c), n = cpu_ldl_be_data(e, 0xd78);
+    int sfix = (src >> 12) == 0x67000;
+    /* A port read DMA is armed BEFORE its CMD17/18 is issued (process_sdhc_transfer_request
+     * 0x10449658 calls invoke_sdhc_buffer_write then sends the command). On hardware the DMA
+     * engine waits for the card's data phase; here it would run synchronously and read the
+     * PREVIOUS command's stale stream position. Defer it until the following CMD17/18
+     * positions the card (frn_dma_d60_flush_read). A still-pending read when a new DMA is
+     * armed is flushed first, against the current card state, as a safety net. */
+    if (frn_dma_rd_pending) frn_dma_d60_flush_read(e);
     cpu_stw_be_data(e, 0xd64, cpu_lduw_be_data(e, 0xd64) & 0x7fff);
+    if (sfix) {
+        frn_dma_rd_pending = 1; frn_dma_rd_dst = dst; frn_dma_rd_n = n;
+        cpu_stw_be_data(e, 0xd62, 0x0100);
+        return;
+    }
+    frn_dma_d60_xfer(e, src, dst, n);
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {

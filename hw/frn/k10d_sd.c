@@ -26,6 +26,7 @@ static uint32_t blklen = 512;
 static uint8_t buf[512];
 static uint32_t buf_len, buf_pos;
 static int rd_active, rd_multi, wr_active, wr_multi;
+static uint32_t rd_blocks_left;     /* blocks still owed by the current CMD17/18 transfer */
 static uint64_t xfer_addr;
 
 static int sd_open(void)
@@ -150,6 +151,11 @@ int k10d_sd_command(uint16_t cmd, uint32_t arg, uint8_t *resp, uint32_t blksize)
     case 16: if (arg >= 1 && arg <= 512) blklen = arg; put_r1(resp, R1); break;
     case 17: case 18:
              xfer_addr = arg; rd_multi = idx == 18; rd_active = 1; wr_active = 0;
+             /* The card serves exactly the command's block count (SDHCI +0x06,
+              * k10d_sd_dbg_regs[2]) then stops: it does NOT keep streaming to satisfy
+              * an oversized DMA. A fresh CMD17/18 is required to read more. count 0
+              * falls back to the old unbounded behaviour. */
+             rd_blocks_left = idx == 18 ? (k10d_sd_dbg_regs[2] ? k10d_sd_dbg_regs[2] : 0xffffffffu) : 1;
              load_block(); put_r1(resp, R1); break;
     case 24: case 25:
              xfer_addr = arg; wr_multi = idx == 25; wr_active = 1; rd_active = 0;
@@ -168,7 +174,8 @@ int k10d_sd_data_read32(uint32_t *v)
 {
     if (!sd_open() || !rd_active) return 0;
     if (buf_pos >= buf_len) {
-        if (!rd_multi) { rd_active = 0; return 0; }
+        if (!rd_multi || rd_blocks_left <= 1) { rd_active = 0; return 0; }
+        rd_blocks_left--;
         xfer_addr += blklen; load_block();
     }
     { static int lg = -1, nl; if (lg < 0) lg = getenv("FRN_SD_LOG") ? 1 : 0;
