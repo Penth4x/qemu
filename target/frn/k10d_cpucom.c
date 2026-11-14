@@ -93,6 +93,11 @@ static void build_status(char c, Msg *m)
      * items 0x29/0x2a); all-zero payloads asserted every input at once and drove boot
      * into a shutdown-like mode transition (0x104329b0(...,3) -> 0x10432a9c parks). */
     memset(m->b + 2, 0xff, n);
+    /* 'B' byte 0 = exposure mode index (field table 0x105a6480: field 0 = byte 0, 0..0x11,
+     * decoded by 0x104f1bb0). 0xff is out of range: the status screen then takes its
+     * "no mode" branch, looks up widget 0x2090082 that is never created, calls through a
+     * null pointer and the camera restarts. 0 = P (shown as "Progrm Automatic Exposure"). */
+    if (c == 'B' && n > 0) m->b[2] = 0x00;
     char var[16]; snprintf(var, sizeof var, "FRN_DSP_%c", c);
     const char *s = getenv(var); int k = 0;
     while (s && *s && k < n) {
