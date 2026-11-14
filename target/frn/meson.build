@@ -4,6 +4,7 @@ frn_ss.add(files(
   'gdbstub.c',
   'helper.c',
   'k10d_cpucom.c',
+  'k10d_flash.c',
   'k10d_imgproc.c',
   'op_helper.c',
   'translate.c',

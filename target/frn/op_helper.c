@@ -16,6 +16,7 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "k10d_cpucom.h"
+#include "k10d_flash.h"
 #include "k10d_imgproc.h"
 static CPUFRNState *k10d_img_env;
 static uint32_t k10d_img_ram16(uint32_t a) { return cpu_lduw_be_data(k10d_img_env, a); }
@@ -1028,6 +1029,7 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
 
 static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
 {
+    if ((a >> 24) == 0x10 && k10d_flash_write(e, a, v, 1)) { frn_wr_watch(e, a, v); return; }
     frn_ft_mem('W', a, v, 1);
     frn_wr_hist(a);
     frn_wr_watch(e, a, v);
@@ -1119,6 +1121,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
 }
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
+    if ((a >> 24) == 0x10 && k10d_flash_write(e, a, v, 2)) { frn_wr_watch(e, a, v); return; }
     if (a < 0x50) { wr8(e, a, v >> 8); wr8(e, a + 1, v); return; }
     frn_ft_mem('W', a, v, 2);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
@@ -1148,6 +1151,8 @@ uint64_t frn_lcd_writes;      /* debug: count of LCD-reg writes */
 uint32_t frn_lcd_scanout;     /* debug: scanout base once programmed */
 static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v)
 {
+    if ((a >> 24) == 0x10 && k10d_flash_enabled()) {
+        k10d_flash_write(e, a, v >> 16, 2); k10d_flash_write(e, a + 2, v & 0xffff, 2); frn_wr_watch(e, a, v); return; }
     if (a < 0x50) { wr8(e, a, v >> 24); wr8(e, a + 1, v >> 16);
                     wr8(e, a + 2, v >> 8); wr8(e, a + 3, v); return; }
     frn_ft_mem('W', a, v, 4);
@@ -1613,6 +1618,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
     ft_step(env, pc);
     k10d_img_tick();                                  /* image-processor operation timing */
     k10d_cpucom_tick();                               /* timed companion-CPU messages */
+    k10d_flash_tick();                                /* deferred flash image save */
     frn_hist_tick(pc);
     /* Full execution + memory trace (windowed). */
     frn_ft_init();
