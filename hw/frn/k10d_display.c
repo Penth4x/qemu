@@ -12,7 +12,8 @@
  * back buffer with image-processor fills (k10d_imgproc.c engine A, mode 0x700).
  *
  * Buttons: the companion CPU reports them in its 'A' status record, byte 3, active-low
- * (0x01 right, 0x02 up, 0x04 down, 0x08 left, 0x10 OK, 0x80 MENU). Keys: arrows, Enter = OK,
+ * (0x01 right, 0x02 left, 0x04 down, 0x08 up, 0x10 OK, 0x80 MENU; up/left confirmed by
+ * Andrew on the live window). Keys: arrows, Enter = OK,
  * M = MENU; P = power off (an all-zero 'A' record, which drives the firmware into its
  * power-off path, where it saves settings to flash; see k10d_flash.c / FRN_FLASH_SAVE).
  * Each change of button state is handed to the companion-CPU model, which queues the
@@ -100,9 +101,9 @@ static void k10d_key_event(DeviceState *dev, QemuConsole *src, QemuInputEvent *e
     uint8_t bit;
     switch (q) {
     case Q_KEY_CODE_RIGHT: bit = 0x01; break;
-    case Q_KEY_CODE_UP:    bit = 0x02; break;
+    case Q_KEY_CODE_LEFT:  bit = 0x02; break;
     case Q_KEY_CODE_DOWN:  bit = 0x04; break;
-    case Q_KEY_CODE_LEFT:  bit = 0x08; break;
+    case Q_KEY_CODE_UP:    bit = 0x08; break;
     case Q_KEY_CODE_RET: case Q_KEY_CODE_KP_ENTER: bit = 0x10; break;
     case Q_KEY_CODE_M:     bit = 0x80; break;
     case Q_KEY_CODE_P:
