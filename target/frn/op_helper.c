@@ -932,6 +932,7 @@ static int frn_tmr_irq(CPUFRNState *e)
 static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
 {
     if (a == 0x5c004023u || a == 0x5c004024u) return 0xffu;      /* serial channel 2 RX (idle bus) */
+    if (a == 0x5c004003u || a == 0x5c004004u) return 0xffu;      /* SR actuator SPI RX (idle) */
 
     frn_ft_mem('R', a, 0, 1);
     frn_rd_hist(a);
@@ -1122,6 +1123,11 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
      * bit 0x800 with no timeout. Model: transfers complete at once (device not identified;
      * received bytes read 0xff). FRN_CH2_LOG=1 logs the bytes sent. */
     if (a == 0x5c004020u) return cpu_lduw_be_data(e, a) | 0x0800u;
+    /* CSIO channel 0 at 0x5c004000 = the SR actuator SPI link (status +0, data +3; bit 0x800
+     * = transfer done). The SR/display-enable path (0x1048f826 -> 0x10440548) busy-waits on
+     * it with no timeout. Model transfers as instant (completion bit always set); RX 0xff.
+     * The actuator semantics are not modelled, only the handshake. */
+    if (a == 0x5c004000u) return cpu_lduw_be_data(e, a) | 0x0800u;
 
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
     frn_ft_mem('R', a, 0, 2);
