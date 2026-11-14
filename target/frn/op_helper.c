@@ -1049,6 +1049,17 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
                     a, (long)(a - frn_wrwatch), v, e->pc);
         }
     }
+    /* FRN_WRVAL=hex: log any store whose VALUE equals this (find where a pointer is bound). */
+    {
+        static int vinit = 0; static uint32_t wval = 0;
+        if (!vinit) { vinit = 1; const char *s = getenv("FRN_WRVAL"); if (s) wval = (uint32_t)strtoul(s, NULL, 16); }
+        if (wval && v == wval) {
+            static int vn;
+            if (vn++ < 2000)
+                fprintf(frn_tr_out ? frn_tr_out : stderr,
+                        "[wrval] 0x%08x stored to 0x%08x from pc~0x%08x rp 0x%08x\n", v, a, e->pc, e->rp);
+        }
+    }
     /* FRN_WRAT_PC=hex[,len]: when PC is within [pc, pc+len) (default 0x40), log
      * the distinct addresses this code window WRITES — finds a rasterizer's
      * pixel target. Histograms targets into 0x10000-granular buckets. */
