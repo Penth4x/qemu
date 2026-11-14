@@ -909,6 +909,16 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
      * never sets -> firmware spins (FUN_1043fd24). Report ready so transfers proceed. */
     if (a == 0x5c005000u) { frn_spi_init();
         if (frn_spi_on) return cpu_ldub_data(e, a) | 0x01u; }
+    /* FRN_GPIO107=hex: main-CPU input pins on port 0x50000107, ORed into reads. Bits 0x20 /
+     * 0x80 / 0x40 are the active-low inputs the screen manager reports as status items
+     * 0x2b / 0x2c / 0x2d (flag objects at screen manager +0x68/+0x6c/+0x70); the port is
+     * RAM-backed and reads 0 (= all asserted) without this. Default 0x80: item 0x2c released.
+     * With it asserted, every companion status update sends the mode controller to mode 0
+     * (rear display off) instead of passing keys to the UI. 0x40 is left asserted (with it
+     * released the key messages are not processed); 0x20 unknown. FRN_GPIO107=0 = old behaviour. */
+    if (a == 0x50000107u) { static int g = -2;
+        if (g == -2) { const char *e = getenv("FRN_GPIO107"); g = e ? (int)strtol(e, NULL, 16) : 0x80; }
+        if (g) return cpu_ldub_data(e, a) | (uint32_t)g; }
     if (a == 0x50000106u) { frn_spi_init();
         if (frn_spi_on) { uint32_t b = cpu_ldub_data(e, a);
             /* DSP handshake (code-derived): main drives req bits 0x20/0x40/0x80 and the
@@ -1602,6 +1612,7 @@ void HELPER(frn_interp)(CPUFRNState *env)
     fa_step(pc, r);
     ft_step(env, pc);
     k10d_img_tick();                                  /* image-processor operation timing */
+    k10d_cpucom_tick();                               /* timed companion-CPU messages */
     frn_hist_tick(pc);
     /* Full execution + memory trace (windowed). */
     frn_ft_init();

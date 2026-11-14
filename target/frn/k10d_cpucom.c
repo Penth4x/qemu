@@ -104,10 +104,57 @@ static void build_status(char c, Msg *m)
     }
 }
 
+/* Timed status messages (FRN_KEYS): "<M insns>:<letter>[:<hex payload>];..." — at that
+ * instruction count (millions) the message is queued and the request interrupt is raised;
+ * the main CPU then polls and receives it. Used to inject button presses after boot. */
+#define LATE_MAX 32
+static struct { uint64_t at; Msg m; } late[LATE_MAX];
+static int late_n, late_next, late_head, late_tail;   /* scheduled [late_next..late_n); due queue [head..tail) */
+static Msg late_due[LATE_MAX];
+static uint64_t st_insns;
+
+static void parse_late(void)
+{
+    const char *q = getenv("FRN_KEYS");
+    while (q && *q && late_n < LATE_MAX) {
+        char *e; uint64_t at = strtoull(q, &e, 0) * 1000000ull;
+        if (e == q || *e != ':') break;
+        char c = e[1]; q = e + 2;
+        if (letter_size(c) < 0) break;
+        build_status(c, &late[late_n].m);
+        if (*q == ':') {
+            q++; int k = 0, n = late[late_n].m.len - 2;
+            while (*q && *q != ';' && k < n) {
+                while (*q == ' ' || *q == ',') q++;
+                char hb[3] = {0}; int j = 0;
+                while (j < 2 && isxdigit((unsigned char)*q)) hb[j++] = *q++;
+                if (!j) break;
+                late[late_n].m.b[2 + k++] = (uint8_t)strtoul(hb, NULL, 16);
+            }
+        }
+        late[late_n].at = at; late_n++;
+        while (*q && *q != ';') q++;
+        if (*q == ';') q++;
+    }
+}
+
+void k10d_cpucom_tick(void)
+{
+    st_insns++;
+    while (late_next < late_n && st_insns >= late[late_next].at && late_tail - late_head < LATE_MAX) {
+        late_due[late_tail++ % LATE_MAX] = late[late_next].m;
+        if (st_log || 1) fprintf(st_out ? st_out : stderr, "[dsp] key/status message '%c' due at %llu insns\n",
+                                 late[late_next].m.b[0], (unsigned long long)st_insns);
+        late_next++;
+        st_attn_sent = 0;
+    }
+}
+
 static void init(FILE *out)
 {
     st_init = 1; st_out = out;
     st_log = getenv("FRN_DSP_LOG") != NULL;
+    parse_late();
     const char *pq = getenv("FRN_DSP_PRE");
     for (; pq && *pq && st_pn < (int)sizeof st_pre; pq++)
         if (letter_size(*pq) >= 0) st_pre[st_pn++] = *pq;
@@ -154,6 +201,11 @@ void k10d_cpucom_txn_start(FILE *out)
 int k10d_cpucom_attention(void)
 {
     static int on = -1; if (on < 0) on = getenv("FRN_DSP_ATTN") != NULL;
+    if (st_init && !st_attn_sent && st_acked_a && late_head < late_tail) {
+        st_attn_sent = 1;
+        if (st_log) fprintf(st_out, "[dsp] attention (vector 31): timed message pending\n");
+        return 1;
+    }
     if (!on || !st_init || st_attn_sent) return 0;
     if (!st_post_done) return 0;
     int pending = (!st_acked_a && !st_a_sent) || (st_acked_a && st_qi < st_qn);
@@ -187,6 +239,7 @@ uint8_t k10d_cpucom_rx(FILE *out)
                 if (++st_a_count >= 2) st_acked_a = 1;     /* 'A' at most twice (boot needed a second) */
             }
             else if (st_acked_a && st_qi < st_qn) build_status(st_queue[st_qi++], &st_cur);
+            else if (st_acked_a && late_head < late_tail) st_cur = late_due[late_head++ % LATE_MAX];
             else if (st_cmd == 0x01) {
                 static const uint8_t echo01[] = { 0x01, 0x04, 0xa1, 0xa2, 0xa3, 0xa4 };
                 memcpy(st_cur.b, echo01, sizeof echo01); st_cur.len = sizeof echo01;
