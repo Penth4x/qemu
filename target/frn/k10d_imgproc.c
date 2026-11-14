@@ -46,6 +46,8 @@ static long countdown[3] = { -1, -1, -1 };
 static FILE *out;
 static void (*st8)(uint32_t, uint8_t);
 void k10d_img_set_store(void (*f)(uint32_t, uint8_t)) { st8 = f; }
+static uint8_t (*ld8)(uint32_t);
+void k10d_img_set_load(uint8_t (*f)(uint32_t)) { ld8 = f; }
 /* Register file for 0x40060000-0x400601ff: the emulator's unbacked I/O space reads 0xffff
  * and drops writes, which broke the firmware's read-modify-write of these registers.
  * Halfwords never written keep reading the old default (0xffff). */
@@ -69,6 +71,69 @@ static const uint32_t rc_base[RC_N] = { 0x40020000u, 0x400f0000u };
 static uint16_t rc_regs[RC_N][0x1000]; static uint8_t rc_written[RC_N][0x1000];
 static uint16_t rc_st_hi[RC_N], rc_st_lo[RC_N]; static long rc_countdown[RC_N] = { -1, -1 };
 static uint16_t rc_get(int u, unsigned off) { unsigned i = off >> 1; return rc_written[u][i] ? rc_regs[u][i] : 0; }
+static int rc_unit(uint32_t a);
+static uint8_t rc_lut[RC_N][0x400];   /* lookup tables: table j at +0x400 + j*0x100 */
+static uint32_t rc_get32(int u, unsigned off) { return ((uint32_t)rc_get(u, off) << 16) | rc_get(u, off + 2); }
+
+/* Byte stores into a converter (the firmware uploads its four 256-byte lookup tables
+ * byte by byte at +0x400..+0x7ff, 0x10505268). */
+int k10d_img_write8(uint32_t a, uint32_t v)
+{
+    if (!k10d_img_enabled()) return 0;
+    int u = rc_unit(a);
+    if (u < 0) return 0;
+    unsigned off = a - rc_base[u];
+    if (off >= 0x400 && off < 0x800) rc_lut[u][off - 0x400] = (uint8_t)v;
+    return 0;
+}
+
+/* The converter operation, performed when it completes. Four channels k = 0..3:
+ *   in_k  = +0x100c + 8k (32-bit address), out_k = +0x1008 + 8k
+ *   rows  = +0x0006, bytes per row = +0x0008, out/in strides = +0x1030 / +0x1032
+ *   control +0x1000 bit 0x10: interleave instead (out_0[4x + k] = in_k[x])
+ *   out_k[x] = clamp((sum_j M[k][j] * LUT_j[in_j[x]]) >> 8), M = 4x4 at +0x0038 (0x100 = 1.0)
+ * Derived from the firmware's font expansion (0x1040bada, glyph atlas for the UI text):
+ * 2-bit packed font in all four inputs, LUT_k extracting one bit position (0x10599c94..),
+ * identity matrix; the CPU then combines the four planes into glyph pixels. Other uses of
+ * the unit (modes, scaling) are not established; this models the per-byte LUT + matrix path. */
+static void rc_perform(int u)
+{
+    if (!ld8 || !st8) return;
+    uint32_t rows = rc_get(u, 0x0006), w = rc_get(u, 0x0008);
+    uint32_t so = rc_get(u, 0x1030), si = rc_get(u, 0x1032);   /* output / input stride */
+    if (!si) si = w;
+    if (!so) so = w;
+    if (!rows || !w || rows > 0x1000 || w > 0x2000) return;
+    int16_t m[4][4];
+    for (int k = 0; k < 4; k++) for (int j = 0; j < 4; j++) m[k][j] = (int16_t)rc_get(u, 0x38 + (k * 4 + j) * 2);
+    uint32_t in[4], outp[4];
+    for (int k = 0; k < 4; k++) {
+        in[k] = 0x80000000u | (rc_get32(u, 0x100c + 8 * k) & 0x3fffffffu);
+        outp[k] = 0x80000000u | (rc_get32(u, 0x1008 + 8 * k) & 0x3fffffffu);
+    }
+    if (rc_get(u, 0x1000) & 0x10) {
+        /* interleave: out0[4x + k] = in_k[x] (the font's second pass packs the four expanded
+         * pixel planes into one 8-bit-per-pixel row; output stride = 4 x input). */
+        for (uint32_t y = 0; y < rows; y++)
+            for (uint32_t x = 0; x < w; x++)
+                for (int k = 0; k < 4; k++)
+                    st8(outp[0] + y * so + 4 * x + k, ld8(in[k] + y * si + x));
+        if (log_on && out) fprintf(out, "[rc%d] interleaved %ux%u x 4 planes\n", u, w, rows);
+        return;
+    }
+    for (uint32_t y = 0; y < rows; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            int l[4];
+            for (int j = 0; j < 4; j++) l[j] = rc_lut[u][j * 0x100 + ld8(in[j] + y * si + x)];   /* table j at +0x400 + j*0x100 (uploader 0x10505252, bases 0x10458120..) */
+            for (int k = 0; k < 4; k++) {
+                int acc = 0;
+                for (int j = 0; j < 4; j++) acc += m[k][j] * l[j];
+                acc >>= 8;
+                st8(outp[k] + y * so + x, (uint8_t)(acc < 0 ? 0 : acc > 255 ? 255 : acc));
+            }
+        }
+    if (log_on && out) fprintf(out, "[rc%d] converted %ux%u bytes x 4 planes\n", u, w, rows);
+}
 static int rc_unit(uint32_t a) { for (int u = 0; u < RC_N; u++) if (a - rc_base[u] < 0x2000) return u; return -1; }
 
 int k10d_img_enabled(void)
@@ -138,6 +203,31 @@ int k10d_img_write16(uint32_t a, uint32_t v, FILE *log, uint32_t (*ram16)(uint32
          * destination +0x98, destination stride +0x8e, width +0x90, height +0x92 (bytes /
          * rows). The firmware clears each display back buffer this way before a redraw
          * (Y = 0x00, Cb/Cr = 0x80, alpha plane = 0x00). */
+        /* Engine A, mode 0x000 = bit extract: each source row is read as 32-bit big-endian
+         * words; the bits selected by the mask +0x84 are packed densely (MSB first) into the
+         * destination (source +0x94 / stride +0x8c, destination +0x98 / stride +0x8e,
+         * destination bytes per row +0x90, rows +0x92). The font loader 0x1040bf20 uses it
+         * with masks 0xaaaaaaaa / 0x55555555 to split 2-bit pixels into high/low bit planes. */
+        if (k == 0 && (v & 0x0f00) == 0x0000 && st8 && ld8) {
+            uint32_t src = 0x80000000u | (r32(IMG_BASE + 0x94) & 0x3fffffffu);
+            uint32_t dst = 0x80000000u | (r32(IMG_BASE + 0x98) & 0x3fffffffu);
+            uint32_t sstr = r16(IMG_BASE + 0x8c) & 0x1ff0, dstr = r16(IMG_BASE + 0x8e) & 0x1ff0;
+            uint32_t w = r16(IMG_BASE + 0x90) & 0x1fff, h = r16(IMG_BASE + 0x92) & 0xfff, mask = r32(IMG_BASE + 0x84);
+            if (mask && w && h && sstr && dstr && w <= dstr)
+                for (uint32_t y = 0; y < h; y++) {
+                    uint32_t sp = src + y * sstr, acc = 0, nb = 0, dx = 0;
+                    while (dx < w) {
+                        uint32_t word = (uint32_t)ld8(sp) << 24 | ld8(sp + 1) << 16 | ld8(sp + 2) << 8 | ld8(sp + 3);
+                        sp += 4;
+                        for (int b = 31; b >= 0 && dx < w; b--) {
+                            if (!(mask >> b & 1)) continue;
+                            acc = (acc << 1) | (word >> b & 1);
+                            if (++nb == 8) { st8(dst + y * dstr + dx++, (uint8_t)acc); acc = 0; nb = 0; }
+                        }
+                    }
+                }
+            if (log_on) fprintf(out, "[img] A bit-extract mask %08x %ux%u\n", mask, w, h);
+        }
         if (k == 0 && (v & 0x0f00) == 0x0700 && st8) {
             uint32_t dst = 0x80000000u | (r32(IMG_BASE + 0x98) & 0x3fffffffu);
             uint32_t stride = r16(IMG_BASE + 0x8e) & 0x1ff0, w = r16(IMG_BASE + 0x90) & 0x1fff,
@@ -181,6 +271,7 @@ int k10d_img_tick(void)
         rc_countdown[u] = -1;
         rc_st_hi[u] |= 0x8000;
         rc_regs[u][0x1000 >> 1] &= ~0x4000;            /* start bit self-clears */
+        rc_perform(u);
         if (log_on && out) fprintf(out, "[rc%d] operation complete\n", u);
         done = 1;
     }
