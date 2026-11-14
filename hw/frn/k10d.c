@@ -28,8 +28,8 @@ uint8_t *k10d_host_lowram, *k10d_host_rom, *k10d_host_sdram, *k10d_host_wram;
  * LCD) are added later as higher-priority device regions over this.
  */
 /* Unmapped-access trap (FRN_LOG_UNMAPPED): every access that falls through to the
- * background handler is to a region we have NOT modeled -- reads return a default
- * (all-ones or 0) and writes are DROPPED. Log each distinct address once, with the
+ * background handler is to a region we have NOT modeled -- reads return what was
+ * written there, else a default (all-ones or 0); see frn_bg_store below. Log each distinct address once, with the
  * firmware PC, so missing peripheral/RAM regions announce themselves instead of
  * silently misbehaving (Andrew d308). */
 static inline uint32_t frn_cur_pc(void)
@@ -53,9 +53,35 @@ static void frn_log_unmapped(const char *kind, uint32_t addr, uint32_t val, unsi
     nlog++;
 }
 
+/* Read-your-writes for unmodelled addresses (Andrew: "the firmware should be able to
+ * read its own writes ... or simply treated as ram"). Every byte the firmware writes to
+ * an address no device model claims is kept in a sparse store and read back exactly;
+ * bytes never written keep the old defaults (all-ones in the MMIO windows, 0 elsewhere).
+ * First writes per address are still reported by FRN_LOG_UNMAPPED. FRN_BG_RAM=0 restores
+ * the old drop-writes behaviour. */
+static GHashTable *frn_bg_store;          /* addr+1 -> byte+1 */
+static int frn_bg_ram_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *s = getenv("FRN_BG_RAM"); on = !(s && s[0] == '0'); }
+    return on;
+}
+static uint64_t frn_bg_stored(hwaddr addr, unsigned size, uint64_t dflt, int *any)
+{
+    uint64_t v = 0; *any = 0;
+    for (unsigned i = 0; i < size; i++) {
+        gpointer p = frn_bg_store ? g_hash_table_lookup(frn_bg_store, GUINT_TO_POINTER((uint32_t)addr + i + 1)) : NULL;
+        uint8_t b = p ? (uint8_t)(GPOINTER_TO_UINT(p) - 1) : (uint8_t)(dflt >> (8 * (size - 1 - i)));
+        if (p) *any = 1;
+        v = (v << 8) | b;
+    }
+    return v;
+}
 static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
 {
-    if (getenv("FRN_DBG_KEYRD")) {
+    static int dbg_keyrd = -1;
+    if (dbg_keyrd < 0) dbg_keyrd = getenv("FRN_DBG_KEYRD") ? 1 : 0;
+    if (dbg_keyrd) {
         static uint32_t seen2[64]; static int ns2;
         int f=0; for(int i=0;i<ns2;i++) if(seen2[i]==(uint32_t)addr){f=1;break;}
         if(!f && ns2<64){ seen2[ns2++]=(uint32_t)addr;
@@ -125,11 +151,32 @@ static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
     }
     /* fremu: MMIO ranges read as all-ones (mmio_default); everything else is
      * RAM that reads 0 when unwritten. */
-    if ((addr >= 0x01000000 && addr < 0x10000000) ||
-        (addr >= 0x40000000 && addr < 0x50000000) ||
-        (addr >= 0x67000000 && addr < 0x67001000)) {
-        return 0xffffffffffffffffULL;
+    int mmio = (addr >= 0x01000000 && addr < 0x10000000) ||
+               (addr >= 0x40000000 && addr < 0x50000000) ||
+               (addr >= 0x67000000 && addr < 0x67001000);
+    uint64_t dflt = mmio ? 0xffffffffffffffffULL : 0;
+    /* Rear LCD controller 0x40070000: status +0x0c bit 0x80 acknowledges the enable bit
+     * written to control +0x0e (app-main 0x104395f4 writes +0x0e = 0x80, then polls
+     * +0x0c & 0x80 at 0x104395fc). With read-your-writes this status must reflect the
+     * control register, not an earlier write to +0x0c. */
+    if (frn_bg_ram_on() && frn_bg_store && addr == 0x4007000c && size == 2) {
+        int any; uint64_t st = frn_bg_stored(addr, 2, 0xffff, &any);
+        uint64_t ctl = frn_bg_stored(0x4007000e, 2, 0xffff, &any);
+        return (st & ~0x80ULL) | (ctl & 0x80);
     }
+    if (frn_bg_ram_on() && frn_bg_store) {
+        int any; uint64_t v = frn_bg_stored(addr, size, dflt, &any);
+        if (any) {
+            static int lg = -1; static int nl;
+            if (lg < 0) lg = getenv("FRN_LOG_BGRAM") ? 1 : 0;
+            uint64_t m = size >= 8 ? ~0ULL : ((1ULL << (8 * size)) - 1);
+            if (lg && v != (dflt & m) && nl++ < 200)
+                fprintf(stderr, "[bgram] rd 0x%08x sz%u = 0x%llx (default 0x%llx) pc~0x%08x\n",
+                        (uint32_t)addr, size, (unsigned long long)v, (unsigned long long)(dflt & m), frn_cur_pc());
+            return v;
+        }
+    }
+    if (mmio) return dflt;
     frn_log_unmapped("RD", (uint32_t)addr, 0, size);   /* truly-dark read -> 0 */
     return 0;
 }
@@ -165,7 +212,13 @@ static void frn_bg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 fprintf(stderr, "[wr] 0x%08x = 0x%08x (sz%u)\n", (uint32_t)addr, (uint32_t)val, size); wnlog++; }
         }
     }
-    frn_log_unmapped("WR", (uint32_t)addr, (uint32_t)val, size);  /* dropped write */
+    frn_log_unmapped("WR", (uint32_t)addr, (uint32_t)val, size);  /* first write per address */
+    if (frn_bg_ram_on()) {
+        if (!frn_bg_store) frn_bg_store = g_hash_table_new(g_direct_hash, g_direct_equal);
+        for (unsigned i = 0; i < size; i++)
+            g_hash_table_insert(frn_bg_store, GUINT_TO_POINTER((uint32_t)addr + i + 1),
+                                GUINT_TO_POINTER((uint32_t)((val >> (8 * (size - 1 - i))) & 0xff) + 1));
+    }
 }
 static const MemoryRegionOps frn_bg_ops = {
     .read = frn_bg_read,
