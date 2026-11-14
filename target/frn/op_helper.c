@@ -1151,6 +1151,27 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
       if (frn_ft_active) fprintf(frn_ft_fp, "  R4 @0x%08x =0x%08x\n", a, r);
       return r; }
 }
+static inline uint32_t rd32(CPUFRNState *e, uint32_t a);
+static inline void wr32(CPUFRNState *e, uint32_t a, uint32_t v);
+/* DMA channel at 0xd60 (the SD driver's block mover, class vtable 0x105c1218, start
+ * 0x104e6920): +0 config (0x813), +2 status (bit 15 busy, bit 8 done, 0x800/0x1000
+ * error), +4 control (bit 15 start), +8 source, +0xc destination, +0x18 byte count.
+ * The SD read path copies from the host's buffer port 0x67000020 (fixed address) into
+ * memory. Model: the copy happens at once in 32-bit units through the normal memory
+ * path (so device models see the port accesses); an address inside 0x67000000-0x67000fff
+ * is held fixed, others increment; then status = done. */
+static void frn_dma_d60_start(CPUFRNState *e)
+{
+    uint32_t src = cpu_ldl_be_data(e, 0xd68), dst = cpu_ldl_be_data(e, 0xd6c), n = cpu_ldl_be_data(e, 0xd78);
+    int sfix = (src >> 12) == 0x67000, dfix = (dst >> 12) == 0x67000;
+    static int lg = -1; if (lg < 0) lg = getenv("FRN_DMA_LOG") ? 1 : 0;
+    if (lg) fprintf(stderr, "[dma d60] 0x%08x -> 0x%08x  %u bytes\n", src, dst, n);
+    if (n > 0x1000000) n = 0;
+    for (uint32_t i = 0; i < n; i += 4)
+        wr32(e, dfix ? dst : dst + i, rd32(e, sfix ? src : src + i));
+    cpu_stw_be_data(e, 0xd62, 0x0100);
+    cpu_stw_be_data(e, 0xd64, cpu_lduw_be_data(e, 0xd64) & 0x7fff);
+}
 static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
 {
     if ((a >> 24) == 0x10 && k10d_flash_write(e, a, v, 2)) { frn_wr_watch(e, a, v); return; }
@@ -1158,6 +1179,7 @@ static inline void wr16(CPUFRNState *e, uint32_t a, uint32_t v)
     frn_ft_mem('W', a, v, 2);
     frn_wr_hist(a); frn_wr_watch(e, a, v);
     cpu_stw_be_data(e, a, v & 0xffff); frn_rbw_mark(a, 2);
+    if (a == 0xd64 && (v & 0x8000)) frn_dma_d60_start(e);
     if ((a & 0xffff0000u) == 0x40060000u || (a - 0x40020000u) < 0x2000u || (a - 0x400f0000u) < 0x2000u) {   /* image-processor model */
         k10d_img_env = e; k10d_img_set_store(k10d_img_st8); k10d_img_set_load(k10d_img_ld8);
         k10d_img_write16(a, v & 0xffff, frn_tr_out ? frn_tr_out : stderr, k10d_img_ram16, k10d_img_ram32);
@@ -1635,6 +1657,17 @@ static void frn_poke_tick(CPUFRNState *e)
 static void frn_interp_one(CPUFRNState *env)
 {
     uint32_t *r = env->regs;
+    /* FRN_DERAIL=1: keep the last 64 PCs (with r1/rp) and dump them once, the first time
+     * execution lands in 0x0-0xfff (a wild jump), to see where the firmware derailed. */
+    { static int dr = -1; static uint32_t ring[64][3]; static unsigned ri; static int dumped;
+      if (dr < 0) dr = getenv("FRN_DERAIL") ? 1 : 0;
+      if (dr) {
+          if (env->pc < 0x1000 && !dumped) { dumped = 1;
+              fprintf(stderr, "[derail] pc=0x%08x; last PCs (oldest first):\n", env->pc);
+              for (unsigned k = 0; k < 64; k++) { unsigned j = (ri + k) % 64;
+                  fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); } }
+          ring[ri % 64][0] = env->pc; ring[ri % 64][1] = r[4]; ring[ri % 64][2] = env->rp; ri++;
+      } }
     if (!frn_tr_ready) {
         frn_trace_setup();
     }

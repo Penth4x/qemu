@@ -19,6 +19,7 @@
 #include "qemu/timer.h"
 #include "cpu.h"
 #include "k10d_display.h"
+#include "k10d_sd.h"
 uint8_t *k10d_host_lowram, *k10d_host_rom, *k10d_host_sdram, *k10d_host_wram;
 
 /*
@@ -295,7 +296,7 @@ static uint8_t frn_p67[0x1000];
 static uint8_t frn_sd_present_bits(void)
 {
     static int st = -1;
-    if (st < 0) st = getenv("FRN_SD") ? 2 : getenv("FRN_SD_PRESENT") ? 1 : 0;
+    if (st < 0) st = k10d_sd_present() ? 2 : getenv("FRN_SD_PRESENT") ? 1 : 0;
     return st == 2 ? 0xff : st == 1 ? 0xf7 : 0xf2;
 }
 
@@ -342,6 +343,9 @@ static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
         /* bits 0-1 command/transfer complete (toggled per poll), bit 5 buffer read
          * ready (sdhc_read_buffer waits for it before reading the data port). */
         uint16_t sync = (uint16_t)ready | 0x0020 | ((frame & 1) ? 0x0003 : 0x0000);
+        if (k10d_sd_present())           /* image-backed card: real buffer-ready bits */
+            sync = (uint16_t)ready | ((frame & 1) ? 0x0003 : 0x0000)
+                 | (k10d_sd_read_ready() ? 0x0020 : 0) | (k10d_sd_write_ready() ? 0x0010 : 0);
         /* FRN_P67_371A_DG (diagnostic): raise the error interrupt during CMD55, so the
          * card does not answer APP_CMD and sd_card_init_worker takes the MMC init table. */
         if (frn_p67_371a_dg) sync |= 0x8000;
@@ -352,6 +356,7 @@ static uint64_t frn_p67_read(void *opaque, hwaddr off, unsigned size)
      * word (sdhc_read_buffer FUN_104499ca). The data depends on the command (last write to
      * +0x0E). CMD6 SWITCH_FUNC (0x063a) status: bit 0x20000 set (function supported),
      * bits 24-27 != 0xf. */
+    if (off == 0x20 && size == 4) { uint32_t dv; if (k10d_sd_data_read32(&dv)) return dv; }
     if (off == 0x20 && size == 4) {
         uint16_t lastcmd = ((uint16_t)frn_p67[0x0e] << 8) | frn_p67[0x0f];
         if (lastcmd == 0x063a) return 0x00020000u;
@@ -371,6 +376,7 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     { static int wl = -1; if (wl < 0) wl = getenv("FRN_LOG_P67") ? 1 : 0;
       if (wl && off < 0x40) fprintf(stderr, "[p67wr] off 0x%03x sz%u = 0x%0*llx\n",
           (unsigned)off, size, size*2, (unsigned long long)val); }
+    if (off == 0x20 && size == 4 && k10d_sd_data_write32((uint32_t)val)) return;   /* card data */
     for (unsigned i = 0; i < size; i++) {
         frn_p67[(off + size - 1 - i) & 0xfff] = (val >> (8 * i)) & 0xff;
     }
@@ -387,6 +393,15 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          * draw-guard bit15 -> build_hw_txn returns 0 -> worker takes build PATH A. */
         { static int dg = -1; if (dg < 0) dg = getenv("FRN_P67_371A_DG") ? 1 : 0;
           if (dg) frn_p67_371a_dg = (cmd == 0x371a); }
+        uint32_t sd_arg = (uint32_t)frn_p67[0x08] << 24 | frn_p67[0x09] << 16 | frn_p67[0x0a] << 8 | frn_p67[0x0b];
+        uint32_t sd_bs = ((uint32_t)frn_p67[0x04] << 8 | frn_p67[0x05]) & 0xfff;
+        { extern uint32_t k10d_sd_dbg_regs[4];
+          k10d_sd_dbg_regs[0] = (uint32_t)frn_p67[0] << 24 | frn_p67[1] << 16 | frn_p67[2] << 8 | frn_p67[3];
+          k10d_sd_dbg_regs[1] = (uint32_t)frn_p67[0x0c] << 8 | frn_p67[0x0d];
+          k10d_sd_dbg_regs[2] = (uint32_t)frn_p67[0x06] << 8 | frn_p67[0x07]; }
+        if (k10d_sd_command(cmd, sd_arg, &frn_p67[0x10], sd_bs)) {
+            /* image-backed card (k10d_sd.c) answered */
+        } else
         if (cmd == 0x0802) {                 /* ping: echo the 0x08 data (0xaa marker) */
             frn_p67[0x10] = frn_p67[0x08]; frn_p67[0x11] = frn_p67[0x09];
             frn_p67[0x12] = frn_p67[0x0a]; frn_p67[0x13] = frn_p67[0x0b];
