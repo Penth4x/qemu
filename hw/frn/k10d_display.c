@@ -11,7 +11,7 @@
  * harness2/render_layers.py, which this mirrors). Before each redraw the firmware clears the
  * back buffer with image-processor fills (k10d_imgproc.c engine A, mode 0x700).
  *
- * Buttons: the companion CPU reports them in its 'A' status record, byte 3, active-low
+ * Buttons: the companion CPU reports them in its 'A' status record, active-low; byte 3
  * (0x01 right, 0x02 left, 0x04 down, 0x08 up, 0x10 OK, 0x80 MENU; up/left confirmed by
  * Andrew on the live window). Keys: arrows, Enter = OK,
  * M = MENU; P = power off (an all-zero 'A' record, which drives the firmware into its
@@ -94,18 +94,23 @@ static const GraphicHwOps k10d_display_ops = {
     .gfx_update = k10d_display_update,
 };
 
+static uint8_t rec[9] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
 static void k10d_key_event(DeviceState *dev, QemuConsole *src, QemuInputEvent *evt)
 {
     int q = qemu_input_linux_to_qcode(evt->key.key);
     bool down = evt->key.down;
-    uint8_t bit;
+    int byte; uint8_t bit;
     switch (q) {
-    case Q_KEY_CODE_RIGHT: bit = 0x01; break;
-    case Q_KEY_CODE_LEFT:  bit = 0x02; break;
-    case Q_KEY_CODE_DOWN:  bit = 0x04; break;
-    case Q_KEY_CODE_UP:    bit = 0x08; break;
-    case Q_KEY_CODE_RET: case Q_KEY_CODE_KP_ENTER: bit = 0x10; break;
-    case Q_KEY_CODE_M:     bit = 0x80; break;
+    case Q_KEY_CODE_RIGHT: byte = 3; bit = 0x01; break;
+    case Q_KEY_CODE_LEFT:  byte = 3; bit = 0x02; break;
+    case Q_KEY_CODE_DOWN:  byte = 3; bit = 0x04; break;
+    case Q_KEY_CODE_UP:    byte = 3; bit = 0x08; break;
+    case Q_KEY_CODE_RET: case Q_KEY_CODE_KP_ENTER: byte = 3; bit = 0x10; break;
+    case Q_KEY_CODE_M:     byte = 3; bit = 0x80; break;   /* MENU */
+    case Q_KEY_CODE_I:     byte = 2; bit = 0x10; break;   /* INFO (opens the shooting-info screen from idle) */
+    case Q_KEY_CODE_V:     byte = 2; bit = 0x20; break;   /* playback: item 0xe, the shooting-mode handler's mode switch (unconfirmed) */
+    case Q_KEY_CODE_F:     byte = 5; bit = 0x08; break;   /* Fn (opens the Fn menu from idle) */
     case Q_KEY_CODE_P:
         if (down) {
             static const uint8_t off[9] = { 0 };
@@ -115,10 +120,9 @@ static void k10d_key_event(DeviceState *dev, QemuConsole *src, QemuInputEvent *e
         return;
     default: return;
     }
-    uint8_t nb = down ? (byte3 & ~bit) : (byte3 | bit);
-    if (nb == byte3) return;                  /* key repeat */
-    byte3 = nb;
-    uint8_t rec[9] = { 0xff, 0xff, 0xff, byte3, 0xff, 0xff, 0xff, 0xff, 0xff };
+    uint8_t nb = down ? (rec[byte] & ~bit) : (rec[byte] | bit);
+    if (nb == rec[byte]) return;                  /* key repeat */
+    rec[byte] = nb;
     k10d_cpucom_post_key_record(rec);
 }
 
