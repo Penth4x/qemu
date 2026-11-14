@@ -399,6 +399,20 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
           k10d_sd_dbg_regs[0] = (uint32_t)frn_p67[0] << 24 | frn_p67[1] << 16 | frn_p67[2] << 8 | frn_p67[3];
           k10d_sd_dbg_regs[1] = (uint32_t)frn_p67[0x0c] << 8 | frn_p67[0x0d];
           k10d_sd_dbg_regs[2] = (uint32_t)frn_p67[0x06] << 8 | frn_p67[0x07]; }
+        { static int wpc = -1; if (wpc < 0) wpc = getenv("FRN_SD_WIPEPC") ? 1 : 0;
+          int wi = cmd >> 8;   /* CMD24=0x18 single write, CMD25=0x19 multi write */
+          if (wpc && (wi == 24 || wi == 25) && sd_arg < 0x20000 && current_cpu) {
+              CPUFRNState *e = &FRN_CPU(current_cpu)->env;
+              fprintf(stderr, "[sdwipe] CMD%d arg 0x%08x (sector %u) PC 0x%08x rp 0x%08x sp 0x%08x\n",
+                      wi, sd_arg, sd_arg >> 9, e->pc, e->rp, e->regs[15]);
+              fprintf(stderr, "[sdwipe]   stack:");
+              for (int k = 0; k < 128; k++) {
+                  uint8_t b[4]; address_space_read(&address_space_memory, e->regs[15] + k*4,
+                      MEMTXATTRS_UNSPECIFIED, b, 4);
+                  uint32_t sv = (uint32_t)b[0]<<24|b[1]<<16|b[2]<<8|b[3];
+                  if (sv >= 0x10000000u && sv < 0x11000000u) fprintf(stderr, " 0x%08x", sv);
+              }
+              fprintf(stderr, "\n"); } }
         if (k10d_sd_command(cmd, sd_arg, &frn_p67[0x10], sd_bs)) {
             /* image-backed card (k10d_sd.c) answered */
         } else

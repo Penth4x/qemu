@@ -187,6 +187,10 @@ int k10d_sd_data_write32(uint32_t v)
     buf[buf_pos] = v >> 24; buf[buf_pos + 1] = v >> 16; buf[buf_pos + 2] = v >> 8; buf[buf_pos + 3] = v;
     buf_pos += 4;
     if (buf_pos >= buf_len) {
+        { static int lg = -1; if (lg < 0) lg = getenv("FRN_SD_LOG") ? 1 : 0;
+          if (lg && xfer_addr < 0x20000)
+              fprintf(stderr, "[sd] WRITE block @%llu (%u port-words): %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                  (unsigned long long)xfer_addr, buf_len/4, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]); }
         if (xfer_addr + buf_len <= img_size && pwrite(fd, buf, buf_len, xfer_addr) < 0)
             fprintf(stderr, "[sd] write error at %llu\n", (unsigned long long)xfer_addr);
         xfer_addr += buf_len; buf_pos = 0;
