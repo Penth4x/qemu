@@ -906,6 +906,19 @@ static void frn_tmr_ctrl_written(CPUFRNState *e, int ch, uint32_t v)
                            if (frn_tmr_ipt < 1) frn_tmr_ipt = 1; }
     frn_tmr_poll(e, ch);
     if (!(v & 0x4)) frn_tmr_uf[ch] = 0;
+    /* Fujitsu reload timer TMCSR: bit1 CNTE (count enable), bit0 TRG (software trigger, reads 0).
+     * The firmware clears UF with a read-modify-write; if TRG read back as 1 that write retriggered
+     * the one-shot forever (release sequencer 0x1040fbc8 never finished). FRN_TMR_OLD=1: old rule. */
+    static int old = -1; if (old < 0) old = getenv("FRN_TMR_OLD") != NULL;
+    if (!old) {
+        if (!(v & 0x2)) { frn_tmr_run[ch] = 0; return; }
+        if (!(v & 0x1) || (v & 0x1000)) return;
+        uint32_t rl = cpu_ldl_be_data(e, FRN_TMR_BASE + ch * 0x10 + 8);
+        frn_tmr_deadline[ch] = frn_ic + ((long)rl + 1) * ((v & 0x800) ? 16 : 1) * frn_tmr_ipt;
+        frn_tmr_run[ch] = 1;
+        cpu_stw_be_data(e, FRN_TMR_BASE + ch * 0x10, v & ~0x1u);   /* TRG is write-only */
+        return;
+    }
     if (!(v & 0x1)) { frn_tmr_run[ch] = 0; return; }
     if (!frn_tmr_run[ch] && !(v & 0x1000)) {
         uint32_t rl = cpu_ldl_be_data(e, FRN_TMR_BASE + ch * 0x10 + 8);
@@ -1809,8 +1822,8 @@ static void frn_interp_one(CPUFRNState *env)
     frn_hist_tick(pc);
     /* Full execution + memory trace (windowed). */
     frn_ft_init();
+    frn_ic++;   /* always: also the reload-timer time base (frn_tmr_*); was counted only under FRN_FT */
     if (frn_ft_on) {
-        frn_ic++;
         if (frn_ft_pcstart && !frn_ft_started && pc == frn_ft_pcstart) {
             frn_ft_started = 1; frn_ft_from = frn_ic; frn_ft_to = frn_ic + frn_ft_win;
         }
