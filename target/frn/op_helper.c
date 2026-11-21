@@ -1773,13 +1773,17 @@ static void frn_interp_one(CPUFRNState *env)
     uint32_t *r = env->regs;
     /* FRN_DERAIL=1: keep the last 64 PCs (with r1/rp) and dump them once, the first time
      * execution lands in 0x0-0xfff (a wild jump), to see where the firmware derailed. */
-    { static int dr = -1; static uint32_t ring[64][3]; static unsigned ri; static int dumped;
-      if (dr < 0) dr = getenv("FRN_DERAIL") ? 1 : 0;
-      if (dr) {
+    /* FRN_NO_REBOOT=1: halt the emulator at the first wild jump (<0x1000) instead of letting the
+     * firmware reset and boot-loop — so a trace captures exactly ONE boot cycle up to the crash. */
+    { static int dr = -1, nrb = -1; static uint32_t ring[64][3]; static unsigned ri; static int dumped;
+      if (dr < 0) { dr = getenv("FRN_DERAIL") ? 1 : 0; nrb = getenv("FRN_NO_REBOOT") ? 1 : 0; }
+      if (dr || nrb) {
           if (env->pc < 0x1000 && !dumped) { dumped = 1;
-              fprintf(stderr, "[derail] pc=0x%08x; last PCs (oldest first):\n", env->pc);
-              for (unsigned k = 0; k < 64; k++) { unsigned j = (ri + k) % 64;
-                  fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); } }
+              if (dr) { fprintf(stderr, "[derail] pc=0x%08x; last PCs (oldest first):\n", env->pc);
+                  for (unsigned k = 0; k < 64; k++) { unsigned j = (ri + k) % 64;
+                      fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); } }
+              if (nrb) { fprintf(stderr, "[no-reboot] halting at first crash pc=0x%08x (cycle 1)\n", env->pc);
+                  fflush(NULL); exit(0); } }
           ring[ri % 64][0] = env->pc; ring[ri % 64][1] = r[4]; ring[ri % 64][2] = env->rp; ri++;
       } }
     if (!frn_tr_ready) {
