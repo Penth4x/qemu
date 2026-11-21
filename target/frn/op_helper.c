@@ -1043,10 +1043,11 @@ static inline void frn_wr_watch(CPUFRNState *e, uint32_t a, uint32_t v)
         if (!nzinit) { nzinit = 1; nzonly = getenv("FRN_WRWATCH_NZ") ? 1 : 0; }
         if (nzonly && v == 0) return;
         static int n;
-        if (n++ < 20000) {
+        if (n++ < 2000000) {
             fprintf(frn_tr_out ? frn_tr_out : stderr,
-                    "[wrwatch] write 0x%08x (+0x%lx) = 0x%08x from pc~0x%08x\n",
-                    a, (long)(a - frn_wrwatch), v, e->pc);
+                    "[wrwatch] write 0x%08x (+0x%lx) = 0x%08x from pc~0x%08x rp 0x%08x\n",
+                    a, (long)(a - frn_wrwatch), v, e->pc, e->rp);
+            fflush(frn_tr_out ? frn_tr_out : stderr);
         }
     }
     /* FRN_WRVAL=hex: log any store whose VALUE equals this (find where a pointer is bound). */
@@ -1782,6 +1783,24 @@ static void frn_interp_one(CPUFRNState *env)
     }
     frn_snapshot(env);
     uint32_t pc = env->pc;
+    /* FRN_POKE=pc:reg:val[,pc:reg:val...] — force register `reg` to `val` just BEFORE the
+     * instruction at `pc` executes. Used to prove whether a specific register value is
+     * load-bearing (e.g. simulate a recompiled callee's lost live-out in the stock firmware). */
+    {
+        static int fp_n = -2; static uint32_t fp_pc[8], fp_val[8]; static int fp_reg[8];
+        if (fp_n == -2) {
+            fp_n = 0; const char *s = getenv("FRN_POKE");
+            while (s && *s && fp_n < 8) {
+                unsigned long a, rg, v;
+                if (sscanf(s, "%lx:%lu:%lx", &a, &rg, &v) == 3) {
+                    fp_pc[fp_n] = (uint32_t)a; fp_reg[fp_n] = (int)rg; fp_val[fp_n] = (uint32_t)v; fp_n++;
+                }
+                s = strchr(s, ','); if (s) s++;
+            }
+        }
+        for (int i = 0; i < fp_n; i++)
+            if (pc == fp_pc[i]) r[fp_reg[i]] = fp_val[i];
+    }
     fa_step(pc, r);
     ft_step(env, pc);
     k10d_img_tick();                                  /* image-processor operation timing */
