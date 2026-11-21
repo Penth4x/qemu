@@ -107,25 +107,33 @@ static void rc_perform(int u)
     int16_t m[4][4];
     for (int k = 0; k < 4; k++) for (int j = 0; j < 4; j++) m[k][j] = (int16_t)rc_get(u, 0x38 + (k * 4 + j) * 2);
     uint32_t in[4], outp[4];
+    int in_on[4], out_on[4];
     for (int k = 0; k < 4; k++) {
+        /* An address register left at 0 = channel unused (the post-capture review op only
+         * sets channel 0). Writing it anyway hit SDRAM 0x80000000 and wiped the IRQ handler
+         * table at 0x8001de28 -> endless vec39. */
+        in_on[k] = (rc_get32(u, 0x100c + 8 * k) & 0x3fffffffu) != 0;
+        out_on[k] = (rc_get32(u, 0x1008 + 8 * k) & 0x3fffffffu) != 0;
         in[k] = 0x80000000u | (rc_get32(u, 0x100c + 8 * k) & 0x3fffffffu);
         outp[k] = 0x80000000u | (rc_get32(u, 0x1008 + 8 * k) & 0x3fffffffu);
     }
     if (rc_get(u, 0x1000) & 0x10) {
         /* interleave: out0[4x + k] = in_k[x] (the font's second pass packs the four expanded
          * pixel planes into one 8-bit-per-pixel row; output stride = 4 x input). */
+        if (!out_on[0]) return;
         for (uint32_t y = 0; y < rows; y++)
             for (uint32_t x = 0; x < w; x++)
                 for (int k = 0; k < 4; k++)
-                    st8(outp[0] + y * so + 4 * x + k, ld8(in[k] + y * si + x));
+                    st8(outp[0] + y * so + 4 * x + k, in_on[k] ? ld8(in[k] + y * si + x) : 0);
         if (log_on && out) fprintf(out, "[rc%d] interleaved %ux%u x 4 planes\n", u, w, rows);
         return;
     }
     for (uint32_t y = 0; y < rows; y++)
         for (uint32_t x = 0; x < w; x++) {
             int l[4];
-            for (int j = 0; j < 4; j++) l[j] = rc_lut[u][j * 0x100 + ld8(in[j] + y * si + x)];   /* table j at +0x400 + j*0x100 (uploader 0x10505252, bases 0x10458120..) */
+            for (int j = 0; j < 4; j++) l[j] = rc_lut[u][j * 0x100 + (in_on[j] ? ld8(in[j] + y * si + x) : 0)];   /* table j at +0x400 + j*0x100 (uploader 0x10505252, bases 0x10458120..) */
             for (int k = 0; k < 4; k++) {
+                if (!out_on[k]) continue;
                 int acc = 0;
                 for (int j = 0; j < 4; j++) acc += m[k][j] * l[j];
                 acc >>= 8;
