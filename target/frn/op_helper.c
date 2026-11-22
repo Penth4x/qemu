@@ -882,6 +882,44 @@ static bool frn_ft_is_func(uint32_t pc)
     }
     return false;
 }
+/* FRN_CODECHECK=<file>: the candidate's valid indirect-control-transfer targets (function entries +
+ * return sites, from scripts/gen_code_targets.py). An indirect call/jmp/ret landing on anything else
+ * is a derail — a corrupted function pointer or return address — caught AT the transfer, not after it
+ * runs garbage. Off unless set. */
+static uint32_t *frn_cc = NULL; static int frn_cc_n = 0, frn_cc_on = -1;
+static void frn_cc_load(void)
+{
+    frn_cc_on = 0;
+    const char *p = getenv("FRN_CODECHECK"); if (!p) return;
+    FILE *fp = fopen(p, "r"); if (!fp) { fprintf(stderr, "[cc] cannot open %s\n", p); return; }
+    char ln[64]; int cap = 0;
+    while (fgets(ln, sizeof ln, fp)) { if (strncmp(ln, "0x", 2)) continue;
+        if (frn_cc_n == cap) { cap = cap ? cap * 2 : 65536; frn_cc = g_renew(uint32_t, frn_cc, cap); }
+        frn_cc[frn_cc_n++] = (uint32_t)strtoul(ln, NULL, 16); }
+    fclose(fp);
+    if (frn_cc_n) qsort(frn_cc, frn_cc_n, sizeof *frn_cc, frn_ft_cmp_u32);
+    frn_cc_on = frn_cc_n > 0;
+    fprintf(stderr, "[cc] FRN_CODECHECK: %d valid targets\n", frn_cc_n);
+}
+static bool frn_cc_ok(uint32_t t)
+{
+    int lo = 0, hi = frn_cc_n - 1;
+    while (lo <= hi) { int m = (lo + hi) / 2;
+        if (frn_cc[m] == t) return true;
+        if (frn_cc[m] < t) lo = m + 1; else hi = m - 1; }
+    return false;
+}
+/* check one indirect transfer target; halt at the first bad one (single-cycle derail capture) */
+static inline void frn_cc_check(CPUFRNState *e, uint32_t target, const char *kind)
+{
+    if (frn_cc_on < 0) frn_cc_load();
+    if (!frn_cc_on) return;
+    if (!frn_cc_ok(target)) {
+        fprintf(stderr, "[cc] DERAIL: %s -> 0x%08x (not a function entry / return site) at pc=0x%08x "
+                        "r4=%08x rp=%08x sp=%08x\n", kind, target, e->pc, e->regs[4], e->rp, e->regs[15]);
+        fflush(NULL); exit(0);
+    }
+}
 static void frn_ft_init(void)
 {
     if (frn_ft_on >= 0) return;
@@ -2176,9 +2214,11 @@ static void frn_interp_one(CPUFRNState *env)
 
     do {
     /* ---- full-word opcodes ---- */
-    if (w == 0x9720) { env->pc = env->rp; break; }                 /* ret */
-    if (w == 0x9F20) { go(env, env->rp, 1); break; }               /* ret:D */
+    if (w == 0x9720) { frn_cc_check(env, env->rp, "ret"); env->pc = env->rp; break; }                 /* ret */
+    if (w == 0x9F20) { frn_cc_check(env, env->rp, "ret:d"); go(env, env->rp, 1); break; }             /* ret:D */
     if (w == 0x9730) {                                             /* reti */
+        /* no codecheck: reti returns to the INTERRUPTED pc (an arbitrary instruction boundary
+         * mid-function), which is neither a function entry nor a return site. */
         uint32_t ptr = rd32(env, r[15]); r[15] += 4;
         uint32_t ps = rd32(env, r[15]); r[15] += 4;
         unpack_ps(env, ps); env->pc = ptr; break;
@@ -2192,6 +2232,8 @@ static void frn_interp_one(CPUFRNState *env)
     /* ---- 12-bit opcodes ---- */
     if (t12 == 0x9F8) { r[ri] = rd32(env, pc + 2); env->pc = pc + 6; break; }    /* ldi:32 */
     if (hi8 == 0x9B) { uint32_t xl = rd16(env, pc + 2); r[ri] = ((xc << 16) | xl) & 0xfffff; env->pc = pc + 4; break; } /* ldi:20 */
+    /* no codecheck on jmp @ri: it is a tail-call (function entry) OR a jump-table dispatch (a case
+     * target inside the function, not an entry/return-site) — ambiguous without the jump tables. */
     if (t12 == 0x970) { env->pc = r[ri]; break; }                  /* jmp @ri */
     if (t12 == 0x9F0) { go(env, r[ri], 1); break; }                /* jmp:D @ri */
     if (t12 == 0x971) {
@@ -2201,9 +2243,9 @@ static void frn_interp_one(CPUFRNState *env)
             if (frn_tr_irq && !f && _vn < 16) { _vs[_vn++] = r[ri];
                 fprintf(frn_tr_out ? frn_tr_out : stderr, "[task1-vtable] pc=%08x -> method=%08x (obj r4=%08x)\n", pc, r[ri], r[4]); }
         }
-        do_call(env, frn_steer_call(pc, r[ri]), pc + 2, 0); break;
+        frn_cc_check(env, r[ri], "call"); do_call(env, frn_steer_call(pc, r[ri]), pc + 2, 0); break;
     }   /* call @ri */
-    if (t12 == 0x9F1) { do_call(env, frn_steer_call(pc, r[ri]), pc + 4, 1); break; }   /* call:D @ri */
+    if (t12 == 0x9F1) { frn_cc_check(env, r[ri], "call:d"); do_call(env, frn_steer_call(pc, r[ri]), pc + 4, 1); break; }   /* call:D @ri */
     if (t12 == 0x070) { r[ri] = rd32(env, r[15]); if (ri != 15) r[15] += 4; break; } /* ld @r15+,ri */
     if (t12 == 0x078) { set_sr(env, ri, rd32(env, r[15])); r[15] += 4; break; }  /* ld @r15+,Rs */
     if (t12 == 0x170) { push32(env, r[ri]); break; }               /* st ri,@-r15 */
