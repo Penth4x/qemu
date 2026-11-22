@@ -1812,14 +1812,18 @@ static void frn_poke_tick(CPUFRNState *e)
 static void frn_interp_one(CPUFRNState *env)
 {
     uint32_t *r = env->regs;
-    /* FRN_DERAIL=1: keep the last 64 PCs (with r1/rp) and dump them once, the first time
-     * execution lands in 0x0-0xfff (a wild jump), to see where the firmware derailed. */
-    /* FRN_NO_REBOOT=1: halt the emulator at the first wild jump (<0x1000) instead of letting the
-     * firmware reset and boot-loop — so a trace captures exactly ONE boot cycle up to the crash. */
+    /* A wild jump = execution leaving the firmware flash image [0x10000000, 0x10900000). The
+     * firmware is XIP from flash (original code + packed code + kernel); it never executes from
+     * SDRAM (0x8xxxxxxx is data) or anywhere else, so ANY pc outside that window is a derail — a
+     * corrupted return/jump/vtable. This catches null/low jumps (<0x1000), SDRAM jumps, and wild
+     * high-address jumps (e.g. a popped-garbage rp) alike.
+     * FRN_DERAIL=1: on the first such jump, dump the last 64 PCs (with r4/rp) to see where it went.
+     * FRN_NO_REBOOT=1: halt at the first such jump instead of boot-looping — so a trace captures
+     * exactly ONE boot cycle up to the crash. */
     { static int dr = -1, nrb = -1; static uint32_t ring[64][3]; static unsigned ri; static int dumped;
       if (dr < 0) { dr = getenv("FRN_DERAIL") ? 1 : 0; nrb = getenv("FRN_NO_REBOOT") ? 1 : 0; }
       if (dr || nrb) {
-          if (env->pc < 0x1000 && !dumped) { dumped = 1;
+          if ((env->pc < 0x10000000 || env->pc >= 0x10900000) && !dumped) { dumped = 1;
               if (dr) { fprintf(stderr, "[derail] pc=0x%08x; last PCs (oldest first):\n", env->pc);
                   for (unsigned k = 0; k < 64; k++) { unsigned j = (ri + k) % 64;
                       fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); } }
