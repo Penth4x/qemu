@@ -937,9 +937,41 @@ static void frn_ft_init(void)
     if (frn_ft_go && !frn_ft_pcstart) frn_ft_pcstart = 1;   /* hold the window until GO (pc 1 never matches) */
     const char *fn = getenv("FRN_FT_FUNCS"); if (fn) frn_ft_load_funcs(fn);
 }
+/* FRN_UNINIT: flag the first read of SDRAM [0x80000000,0x88000000) never written since power-on
+ * — an uninitialized read, i.e. the firmware skipped an init stock performs (or read a garbage
+ * pointer). We must not tolerate these: a real init writes before it reads. Compare candidate vs
+ * stock: reads stock ALSO makes are expected (benign / DMA filled outside this path); a
+ * candidate-only uninit read is the real divergence, pinpointed AT the read (the root), not at the
+ * crash it eventually causes. 1 bit per SDRAM byte = 16 MB. Reported once per byte. */
+#define FRN_UI_LO 0x80000000u
+#define FRN_UI_HI 0x88000000u
+static uint8_t *frn_ui_map; static int frn_ui_on = -1;
+static inline void frn_ui_init(void){
+    if (frn_ui_on >= 0) return;
+    frn_ui_on = getenv("FRN_UNINIT") ? 1 : 0;
+    if (frn_ui_on) frn_ui_map = calloc((FRN_UI_HI - FRN_UI_LO) / 8, 1);
+}
+static inline void frn_ui_mark(uint32_t a, int sz){
+    if (frn_ui_on <= 0) return;
+    for (int i = 0; i < sz; i++){ uint32_t x = a + i;
+        if (x >= FRN_UI_LO && x < FRN_UI_HI){ uint32_t o = x - FRN_UI_LO; frn_ui_map[o>>3] |= (uint8_t)(1u << (o & 7)); } }
+}
+static inline void frn_ui_check(CPUFRNState *e, uint32_t a, int sz){
+    frn_ui_init();
+    if (frn_ui_on <= 0) return;
+    for (int i = 0; i < sz; i++){ uint32_t x = a + i;
+        if (x >= FRN_UI_LO && x < FRN_UI_HI){ uint32_t o = x - FRN_UI_LO;
+            if (!(frn_ui_map[o>>3] & (1u << (o & 7)))){
+                static long n = 0;
+                if (n++ < 500000) fprintf(frn_tr_out ? frn_tr_out : stderr,
+                    "[uninit] read %d@0x%08x pc=0x%08x rp=0x%08x\n", sz, a, e->pc, e->rp);
+                frn_ui_map[o>>3] |= (uint8_t)(1u << (o & 7)); } } }   /* report once */
+}
 static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
 {
     fa_mem(a);
+    frn_ui_init();
+    if (kind == 'W') frn_ui_mark(a, sz);
     if (!frn_ft_active) return;
     if (kind == 'W') fprintf(frn_ft_fp, "  W%d @0x%08x =0x%08x\n", sz, a, v);
     else             fprintf(frn_ft_fp, "  R%d @0x%08x\n", sz, a);
@@ -1027,6 +1059,7 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
     if (a == 0x5c004003u || a == 0x5c004004u) return 0xffu;      /* SR actuator SPI RX (idle) */
 
     frn_ft_mem('R', a, 0, 1);
+    frn_ui_check(e, a, 1);
     frn_rd_hist(a);
     frn_rd_watch(e, a);
     /* Black-box DSP GPIO handshake at 0x50000106: the firmware sets bit 0x40 ("byte
@@ -1235,6 +1268,7 @@ static inline uint32_t rd16(CPUFRNState *e, uint32_t a)
 
     if (a < 0x50) return (rd8(e, a) << 8) | rd8(e, a + 1);
     frn_ft_mem('R', a, 0, 2);
+    frn_ui_check(e, a, 2);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t fv; if (frn_force_lookup(a, &fv)) return fv & 0xffff; }
     { uint32_t iv; if (k10d_img_read16(a, &iv)) return iv & 0xffff; }   /* image-processor model */
@@ -1277,6 +1311,7 @@ static inline uint32_t rd32(CPUFRNState *e, uint32_t a)
     if (a < 0x50) return (rd8(e, a) << 24) | (rd8(e, a + 1) << 16)
                        | (rd8(e, a + 2) << 8) | rd8(e, a + 3);
     fa_mem(a);
+    frn_ui_check(e, a, 4);
     frn_rd_hist(a); frn_rd_watch(e, a);
     { uint32_t iv; if (k10d_img_read32(a, &iv)) return iv; }   /* image-processor model */
     { uint32_t fv; if (frn_force_lookup(a, &fv)) {
@@ -1861,11 +1896,19 @@ static void frn_interp_one(CPUFRNState *env)
     { static int dr = -1, nrb = -1; static uint32_t ring[64][3]; static unsigned ri; static int dumped;
       if (dr < 0) { dr = getenv("FRN_DERAIL") ? 1 : 0; nrb = getenv("FRN_NO_REBOOT") ? 1 : 0; }
       if (dr || nrb) {
-          if ((env->pc < 0x10000000 || env->pc >= 0x10900000) && !dumped) { dumped = 1;
-              if (dr) { fprintf(stderr, "[derail] pc=0x%08x; last PCs (oldest first):\n", env->pc);
+          /* A derail is (a) pc leaving the flash image, OR (b) re-entry to the reset vector
+           * 0x10008000 after boot has started — a REBOOT (watchdog / panic / wild jump into crt0).
+           * The reset vector is in-range, so the range check alone silently loops the reboot
+           * forever; trap it so a single-cycle trace stops AT the first reboot and the ring shows
+           * what triggered it. frn_ic > 64 skips the ONE legitimate reset entry at power-on. */
+          int oor = (env->pc < 0x10000000 || env->pc >= 0x10900000);
+          int reboot = (env->pc == 0x10008000 && frn_ic > 64);
+          if ((oor || reboot) && !dumped) { dumped = 1;
+              const char *why = reboot ? "reboot (reset-vector re-entry)" : "derail";
+              if (dr) { fprintf(stderr, "[derail] %s pc=0x%08x; last PCs (oldest first):\n", why, env->pc);
                   for (unsigned k = 0; k < 64; k++) { unsigned j = (ri + k) % 64;
                       fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); } }
-              if (nrb) { fprintf(stderr, "[no-reboot] halting at first crash pc=0x%08x (cycle 1)\n", env->pc);
+              if (nrb) { fprintf(stderr, "[no-reboot] halting at first %s pc=0x%08x (ic=%ld)\n", why, env->pc, frn_ic);
                   fflush(NULL); exit(0); } }
           ring[ri % 64][0] = env->pc; ring[ri % 64][1] = r[4]; ring[ri % 64][2] = env->rp; ri++;
       } }
