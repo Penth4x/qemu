@@ -14,7 +14,11 @@
  * Buttons: the companion CPU reports them in its 'A' status record, active-low; byte 3
  * (0x01 right, 0x02 left, 0x04 down, 0x08 up, 0x10 OK, 0x80 MENU; up/left confirmed by
  * Andrew on the live window). Keys: arrows, Enter = OK,
- * M = MENU, I = INFO (byte 2 0x10), F = Fn (byte 5 0x08), V = playback guess (byte 2 0x20);
+ * M / Esc = MENU, I = INFO (byte 2 0x10), F = Fn (byte 5 0x08), V / D = DISP (byte 2 0x20);
+ * S = shutter half-press, A = AF, E = AEL, G = GREEN, W = PRV, Z = XV/AVSET, R = RAW,
+ * X = SR, Backspace/Delete = ERASE, U = flash pop-up, C = card door (bits listed below).
+ * The shutter full press (SWR, byte 0 0x02) is deliberately not bound: the capture path
+ * needs the control CPU and wedges the firmware without it.
  * P = power off (an all-zero 'A' record, which drives the firmware into its
  * power-off path, where it saves settings to flash; see k10d_flash.c / FRN_FLASH_SAVE).
  * Each change of button state is handed to the companion-CPU model, which queues the
@@ -108,9 +112,24 @@ static void k10d_key_event(DeviceState *dev, QemuConsole *src, QemuInputEvent *e
     case Q_KEY_CODE_DOWN:  byte = 3; bit = 0x04; break;
     case Q_KEY_CODE_UP:    byte = 3; bit = 0x08; break;
     case Q_KEY_CODE_RET: case Q_KEY_CODE_KP_ENTER: byte = 3; bit = 0x10; break;
-    case Q_KEY_CODE_M:     byte = 3; bit = 0x80; break;   /* MENU */
+    case Q_KEY_CODE_M: case Q_KEY_CODE_ESC: byte = 3; bit = 0x80; break;   /* MENU / back (Esc) */
+    /* Found with the firmware's own SWITCH TEST screen (debug menu, MODSET.TXT [OPEN_DEBUG_MENU]) by
+     * clearing each record bit in turn and reading which label lit up. Active-low like the rest. */
+    case Q_KEY_CODE_S:     byte = 0; bit = 0x01; break;   /* SWS: shutter half-press */
+    case Q_KEY_CODE_A:     byte = 0; bit = 0x08; break;   /* AFSTART (AF button) */
+    case Q_KEY_CODE_E:     byte = 2; bit = 0x01; break;   /* AEL */
+    case Q_KEY_CODE_G:     byte = 2; bit = 0x02; break;   /* GREEN */
+    case Q_KEY_CODE_W:     byte = 2; bit = 0x04; break;   /* PRV (preview) */
+    case Q_KEY_CODE_C:     byte = 2; bit = 0x08; break;   /* DOOR: card door */
+    case Q_KEY_CODE_D:     byte = 2; bit = 0x20; break;   /* DISP (same bit as V) */
+    case Q_KEY_CODE_Z:     byte = 2; bit = 0x80; break;   /* XV or AVSET: both labels light for this bit */
+    case Q_KEY_CODE_U:     byte = 4; bit = 0x01; break;   /* FLPOP: flash pop-up */
+    case Q_KEY_CODE_R:     byte = 5; bit = 0x01; break;   /* RAW */
+    case Q_KEY_CODE_X:     byte = 5; bit = 0x04; break;   /* SR (shake reduction) */
+    case Q_KEY_CODE_BACKSPACE: case Q_KEY_CODE_DELETE:
+                           byte = 5; bit = 0x40; break;   /* ERASE */
     case Q_KEY_CODE_I:     byte = 2; bit = 0x10; break;   /* INFO (opens the shooting-info screen from idle) */
-    case Q_KEY_CODE_V:     byte = 2; bit = 0x20; break;   /* playback: item 0xe, the shooting-mode handler's mode switch (unconfirmed) */
+    case Q_KEY_CODE_V:     byte = 2; bit = 0x20; break;   /* DISP (SWITCH TEST; was a playback guess) */
     case Q_KEY_CODE_F:     byte = 5; bit = 0x08; break;   /* Fn (opens the Fn menu from idle) */
     case Q_KEY_CODE_P:
         if (down) {
