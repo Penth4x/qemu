@@ -836,6 +836,12 @@ static void frn_spi_init(void)
  *   FRN_FT_FROM=<n> FRN_FT_TO=<n>   log only instructions [from,to] (raw count)
  *   FRN_FT_PC=<hex>      alternative: start logging when PC first reaches this,
  *                        for FRN_FT_WIN instructions (default 200000)
+ *   FRN_FT_GO=<path>     alternative: start the FRN_FT_WIN window once this file
+ *                        exists (polled every 2^20 instructions), so a trace can be
+ *                        armed from outside right before an action: `touch <path>`
+ *   FRN_FT_FUNCS=<file>  inside the window, log only entries to the listed PCs
+ *                        (lines "0xADDR [name]", e.g. from firmware.map), as
+ *                        "<ic> F=0x.. r4=.. r5=.. r6=.. rp=..", and no memory lines
  * Emits one line per instruction: "<ic> PC=0x.. r4=.. r5=.. r13=..", and per
  * memory access within the window: "  R/W sz@0x.. =0x..". This is the full path +
  * RAM/MMIO access log to pinpoint exactly where boot diverges. */
@@ -844,6 +850,38 @@ static int      frn_ft_on = -1, frn_ft_active = 0;
 static long     frn_ft_from = 0, frn_ft_to = 0, frn_ft_win = 200000, frn_ft_pcstart = 0, frn_ft_started = 0;
 static int      frn_ft_fullregs = 0;     /* FRN_FT_FULLREGS=1: log all 16 regs per line */
 static FILE    *frn_ft_fp = NULL;
+static const char *frn_ft_go = NULL;     /* FRN_FT_GO trigger file */
+static uint32_t *frn_ft_fn = NULL;       /* FRN_FT_FUNCS: sorted entry PCs */
+static int      frn_ft_fn_n = 0;
+static int frn_ft_cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+static void frn_ft_load_funcs(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) { fprintf(stderr, "[ft] FRN_FT_FUNCS: cannot open %s\n", path); return; }
+    char ln[256]; int cap = 0;
+    while (fgets(ln, sizeof ln, fp)) {
+        if (strncmp(ln, "0x", 2)) continue;
+        if (frn_ft_fn_n == cap) { cap = cap ? cap * 2 : 4096; frn_ft_fn = g_renew(uint32_t, frn_ft_fn, cap); }
+        frn_ft_fn[frn_ft_fn_n++] = (uint32_t)strtoul(ln, NULL, 16);
+    }
+    fclose(fp);
+    if (frn_ft_fn_n) qsort(frn_ft_fn, frn_ft_fn_n, sizeof *frn_ft_fn, frn_ft_cmp_u32);
+    fprintf(stderr, "[ft] FRN_FT_FUNCS: %d entry PCs\n", frn_ft_fn_n);
+}
+static bool frn_ft_is_func(uint32_t pc)
+{
+    int lo = 0, hi = frn_ft_fn_n - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (frn_ft_fn[m] == pc) return true;
+        if (frn_ft_fn[m] < pc) lo = m + 1; else hi = m - 1;
+    }
+    return false;
+}
 static void frn_ft_init(void)
 {
     if (frn_ft_on >= 0) return;
@@ -857,6 +895,9 @@ static void frn_ft_init(void)
     const char *p = getenv("FRN_FT_PC");   if (p) frn_ft_pcstart = strtoul(p, NULL, 16);
     const char *w = getenv("FRN_FT_WIN");  if (w) frn_ft_win = strtol(w, NULL, 0);
     const char *f = getenv("FRN_FT_FULLREGS"); if (f) frn_ft_fullregs = 1;
+    frn_ft_go = getenv("FRN_FT_GO");
+    if (frn_ft_go && !frn_ft_pcstart) frn_ft_pcstart = 1;   /* hold the window until GO (pc 1 never matches) */
+    const char *fn = getenv("FRN_FT_FUNCS"); if (fn) frn_ft_load_funcs(fn);
 }
 static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
 {
@@ -1831,10 +1872,19 @@ static void frn_interp_one(CPUFRNState *env)
         if (frn_ft_pcstart && !frn_ft_started && pc == frn_ft_pcstart) {
             frn_ft_started = 1; frn_ft_from = frn_ic; frn_ft_to = frn_ic + frn_ft_win;
         }
+        if (frn_ft_go && !frn_ft_started && (frn_ic & 0xfffff) == 0 && access(frn_ft_go, F_OK) == 0) {
+            frn_ft_started = 1; frn_ft_from = frn_ic; frn_ft_to = frn_ic + frn_ft_win;
+            fprintf(stderr, "[ft] FRN_FT_GO: window starts at ic %ld\n", frn_ic);
+        }
         frn_ft_active = (frn_ic >= frn_ft_from &&
                          (frn_ft_to == 0 || frn_ic <= frn_ft_to) &&
                          (!frn_ft_pcstart || frn_ft_started));
-        if (frn_ft_active) {
+        if (frn_ft_active && frn_ft_fn) {
+            if (frn_ft_is_func(pc))
+                fprintf(frn_ft_fp, "%ld F=0x%08x r4=%08x r5=%08x r6=%08x rp=%08x\n",
+                        frn_ic, pc, r[4], r[5], r[6], env->rp);
+            frn_ft_active = 0;   /* function-entry mode: no per-instruction or memory lines */
+        } else if (frn_ft_active) {
             if (frn_ft_fullregs)
                 fprintf(frn_ft_fp, "%ld PC=0x%08x r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x r13=%08x r14=%08x r15=%08x\n",
                         frn_ic, pc, r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
