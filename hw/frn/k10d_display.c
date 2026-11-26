@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /*
  * K10D rear display + rear buttons for interactive use.
  *
@@ -64,6 +65,7 @@ static bool k10d_display_update(void *opaque)
 {
     DisplaySurface *s = qemu_console_surface(con);
     uint32_t base_a = rd32(0x40040308) & 0x3ffffff0, base_b = rd32(0x40040328) & 0x3ffffff0;
+    { static int _d=0; if(getenv("FRN_LCD_DBG") && (_d++ & 0x3f)==0) fprintf(stderr,"[lcd] 308=%08x(base_a=%08x) 328=%08x(base_b=%08x) 334=%08x\n",rd32(0x40040308),base_a,rd32(0x40040328),base_b,rd32(0x40040334)); }
     if (base_a) address_space_read(&address_space_memory, 0x80000000u | base_a, MEMTXATTRS_UNSPECIFIED, frame_a, FRAME);
     if (base_b) address_space_read(&address_space_memory, 0x80000000u | base_b, MEMTXATTRS_UNSPECIFIED, frame_b, FRAME);
     uint32_t base_al = rd32(0x40040334) & 0x3ffffff0;

@@ -1586,6 +1586,29 @@ static inline void do_call(CPUFRNState *e, uint32_t target, uint32_t ret, int de
     e->rp = ret; fa_call(target, ret); go(e, target, delayed);
 }
 
+/* FRN_INPLACE: a jump/call FROM recompiled (packed, >=0x10622400) code INTO the original
+ * in-place code region (<0x10622400) is, per the recompile contract, a DEFECT: either a
+ * callee that was never decompiled/redirected, or a function pointer / vtable slot the fnptr
+ * scanners missed (so it still holds the ORIGINAL address). Enumerate each distinct target
+ * (deduped) with the source PC + transfer kind. FRN_INPLACE_HALT=1 stops at the first one. */
+#define FRN_IP_CODEBASE 0x10622400u
+static void frn_inplace_check(CPUFRNState *e, uint32_t src, uint32_t target, const char *kind)
+{
+    static int ip_init = 0, ip_on = 0, ip_halt = 0;
+    if (!ip_init) { ip_init = 1; ip_on = getenv("FRN_INPLACE") != NULL;
+                    ip_halt = getenv("FRN_INPLACE_HALT") != NULL; }
+    if (!ip_on) return;
+    if (!(src >= FRN_IP_CODEBASE && src < FW_END)) return;        /* source must be recompiled code */
+    if (!(target >= 0x10008000u && target < FRN_IP_CODEBASE)) return; /* target in original code */
+    if (target >= 0x100f0000u && target < 0x100f1800u) return;    /* crt0: intentionally in-place */
+    static uint32_t seen[2048]; static int nseen = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == target) return;
+    if (nseen < 2048) seen[nseen++] = target;
+    fprintf(stderr, "[inplace] %-7s src=0x%08x -> ORIGINAL 0x%08x  (missing decompile or undetected fnptr) #%d\n",
+            kind, src, target, nseen);
+    if (ip_halt) { fflush(NULL); exit(0); }
+}
+
 /* ---- Milbeaut reload timer + FR interrupt delivery (fremu port) ---- */
 static void frn_timer_reg_written(CPUFRNState *e)
 {
@@ -1625,6 +1648,16 @@ static void frn_timer_tick(CPUFRNState *e)
 static void frn_watch_tick(CPUFRNState *e)
 {
     uint32_t icr = frn_icr(e, WC_ICR) & 0x1F;
+    /* DIAG (FRN_TRACE_IRQ): log the first time firmware unmasks ICR25 (vec41). If this
+     * never prints for a candidate, intc_init never ran / never wrote 0x459 != 0x1f. */
+    if (frn_tr_irq) {
+        static uint32_t wc_icr_last = 0x1F;
+        if (icr != wc_icr_last) {
+            fprintf(frn_tr_out, "[irq] ICR25(0x459) %u -> %u  (vec41 %s)  pc=0x%08x\n",
+                    wc_icr_last, icr, icr==0x1F?"MASKED":"ENABLED", e->pc);
+            wc_icr_last = icr;
+        }
+    }
     if (icr == 0x1F) return;              /* not enabled by firmware yet */
     if (++e->wc_div < WC_PERIOD) return;
     e->wc_div = 0;
@@ -1750,9 +1783,29 @@ static void frn_deliver(CPUFRNState *e)
         lev[j+1] = tl; vec[j+1] = tv; kind[j+1] = tk;
     }
     for (int i = 0; i < n; i++) {
-        if (!(e->ilm > lev[i])) continue;
+        if (!(e->ilm > lev[i])) {
+            /* DIAG: a pending source blocked by the interrupt level mask (ILM). */
+            if (frn_tr_irq && kind[i] == 2) {
+                static long wc_ilm_drop = 0;
+                if ((wc_ilm_drop++ & 0x3FF) == 0)
+                    fprintf(frn_tr_out, "[irq] vec41 wc_pending DROPPED by ILM: ilm=%u level=%u (#%ld)\n",
+                            e->ilm, lev[i], wc_ilm_drop);
+            }
+            continue;
+        }
         uint32_t handler = rd32(e, e->tbr + 0x3FC - vec[i] * 4);
-        if (!(handler >= FW_BASE && handler < FW_END)) continue;
+        if (!(handler >= FW_BASE && handler < FW_END)) {
+            /* DIAG: a pending source whose vector-table handler is out of FW range
+             * (bad TBR table / relocation). */
+            if (frn_tr_irq && kind[i] == 2) {
+                static long wc_h_drop = 0;
+                if ((wc_h_drop++ & 0x3FF) == 0)
+                    fprintf(frn_tr_out, "[irq] vec41 wc_pending DROPPED by handler-range: "
+                            "tbr=0x%08x entry@0x%08x handler=0x%08x (#%ld)\n",
+                            e->tbr, e->tbr + 0x3FC - vec[i] * 4, handler, wc_h_drop);
+            }
+            continue;
+        }
         if (kind[i] == 0) e->pending_valid = 0;  /* DICR stays until FW clears 0x44 */
         if (kind[i] == 2) e->wc_pending = 0;
         if (kind[i] == 4) cpucom_attn = 0;
@@ -1907,11 +1960,31 @@ static void frn_interp_one(CPUFRNState *env)
               const char *why = reboot ? "reboot (reset-vector re-entry)" : "derail";
               if (dr) { fprintf(stderr, "[derail] %s pc=0x%08x; last PCs (oldest first):\n", why, env->pc);
                   for (unsigned k = 0; k < 64; k++) { unsigned j = (ri + k) % 64;
-                      fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); } }
+                      fprintf(stderr, "  0x%08x r4=%08x rp=%08x\n", ring[j][0], ring[j][1], ring[j][2]); }
+                  fprintf(stderr, "[derail] regs @fault:");
+                  for (int k = 0; k < 16; k++) fprintf(stderr, " r%d=%08x", k, env->regs[k]);
+                  fprintf(stderr, " rp=%08x tbr=%08x\n", env->rp, env->tbr); }
               if (nrb) { fprintf(stderr, "[no-reboot] halting at first %s pc=0x%08x (ic=%ld)\n", why, env->pc, frn_ic);
                   fflush(NULL); exit(0); } }
           ring[ri % 64][0] = env->pc; ring[ri % 64][1] = r[4]; ring[ri % 64][2] = env->rp; ri++;
       } }
+    /* FRN_PCLOG=<hex>: print ic + r4..r7 every time PC hits <hex> (function entry logger).
+     * The LAST line before a derail is the fatal invocation's incoming args. */
+    { static int pl=0; static uint32_t plpc=0;
+      if (!pl){ pl=1; const char*s=getenv("FRN_PCLOG"); if(s) plpc=(uint32_t)strtoul(s,NULL,16); }
+      if (plpc && env->pc==plpc){
+        fprintf(stderr,"[pclog] ic=%ld pc=%08x r4=%08x r5=%08x r6=%08x r7=%08x rp=%08x",
+                frn_ic, env->pc, env->regs[4], env->regs[5], env->regs[6], env->regs[7], env->rp);
+        /* FRN_PCLOG_MEM=off[,off...]: also dump *(r4+off) for each (hex offsets, may be signed). */
+        const char *mm=getenv("FRN_PCLOG_MEM");
+        while(mm&&*mm){ char*e; long off=strtol(mm,&e,16); if(e==mm)break;
+          uint32_t a=env->regs[4]+(uint32_t)off; fprintf(stderr," [r4+%lx=@%08x]=%08x",off,a,rd32(env,a));
+          mm=(*e==',')?e+1:e; }
+        /* FRN_PCLOG_ABS=hexaddr[,hexaddr...]: dump absolute memory words too. */
+        const char *ma=getenv("FRN_PCLOG_ABS");
+        while(ma&&*ma){ char*e; uint32_t a=(uint32_t)strtoul(ma,&e,16); if(e==ma)break;
+          fprintf(stderr," [@%08x]=%08x",a,rd32(env,a)); ma=(*e==',')?e+1:e; }
+        fprintf(stderr,"\n"); } }
     if (!frn_tr_ready) {
         frn_trace_setup();
     }
@@ -1923,6 +1996,15 @@ static void frn_interp_one(CPUFRNState *env)
         frn_deliver(env);          /* may set env->pc to an ISR handler */
         frn_wake_inject(env);      /* diagnostic: post a chosen eventflag from idle */
         frn_poke_tick(env);        /* diagnostic: one-shot/periodic memory writes from idle */
+        /* FRN_TCB_DUMP=<file>: once settled in the idle task, dump the uITRON TCB array
+         * (0x6a001be8, stride 0x44) so stock-vs-cand task states can be diffed to find a deadlock. */
+        { static int td=0; static long tc=0; const char *tf;
+          if (!td && (tf=getenv("FRN_TCB_DUMP")) && (env->pc==0x10491512u || env->pc==0x1000f530u)) {
+            if (tc++ > 3000) { td=1;
+              FILE *tfp=fopen(tf,"wb");
+              if (tfp){ for (uint32_t a=0x6a001be8u; a<0x6a001be8u+0x3100u; a+=4){ uint32_t v=rd32(env,a); uint8_t b[4]={v>>24,v>>16,v>>8,v}; fwrite(b,1,4,tfp);} fclose(tfp);
+                fprintf(stderr,"[tcb] dumped TCB array to %s\n", tf); }
+              fflush(NULL); exit(0); } } }
     }
     frn_snapshot(env);
     uint32_t pc = env->pc;
@@ -2277,8 +2359,8 @@ static void frn_interp_one(CPUFRNState *env)
     if (hi8 == 0x9B) { uint32_t xl = rd16(env, pc + 2); r[ri] = ((xc << 16) | xl) & 0xfffff; env->pc = pc + 4; break; } /* ldi:20 */
     /* no codecheck on jmp @ri: it is a tail-call (function entry) OR a jump-table dispatch (a case
      * target inside the function, not an entry/return-site) — ambiguous without the jump tables. */
-    if (t12 == 0x970) { env->pc = r[ri]; break; }                  /* jmp @ri */
-    if (t12 == 0x9F0) { go(env, r[ri], 1); break; }                /* jmp:D @ri */
+    if (t12 == 0x970) { frn_inplace_check(env, pc, r[ri], "jmp");   env->pc = r[ri]; break; }  /* jmp @ri */
+    if (t12 == 0x9F0) { frn_inplace_check(env, pc, r[ri], "jmp:d"); go(env, r[ri], 1); break; }/* jmp:D @ri */
     if (t12 == 0x971) {
         if (pc >= 0x10439674 && pc <= 0x104396d0) {
             static uint32_t _vs[16]; static int _vn;
@@ -2286,9 +2368,10 @@ static void frn_interp_one(CPUFRNState *env)
             if (frn_tr_irq && !f && _vn < 16) { _vs[_vn++] = r[ri];
                 fprintf(frn_tr_out ? frn_tr_out : stderr, "[task1-vtable] pc=%08x -> method=%08x (obj r4=%08x)\n", pc, r[ri], r[4]); }
         }
+        frn_inplace_check(env, pc, r[ri], "call");
         frn_cc_check(env, r[ri], "call"); do_call(env, frn_steer_call(pc, r[ri]), pc + 2, 0); break;
     }   /* call @ri */
-    if (t12 == 0x9F1) { frn_cc_check(env, r[ri], "call:d"); do_call(env, frn_steer_call(pc, r[ri]), pc + 4, 1); break; }   /* call:D @ri */
+    if (t12 == 0x9F1) { frn_inplace_check(env, pc, r[ri], "call:d"); frn_cc_check(env, r[ri], "call:d"); do_call(env, frn_steer_call(pc, r[ri]), pc + 4, 1); break; }   /* call:D @ri */
     if (t12 == 0x070) { r[ri] = rd32(env, r[15]); if (ri != 15) r[15] += 4; break; } /* ld @r15+,ri */
     if (t12 == 0x078) { set_sr(env, ri, rd32(env, r[15])); r[15] += 4; break; }  /* ld @r15+,Rs */
     if (t12 == 0x170) { push32(env, r[ri]); break; }               /* st ri,@-r15 */
