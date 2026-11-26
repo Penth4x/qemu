@@ -1093,6 +1093,10 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
              * Lines 0x02/0x04 keep the inverse-of-request rule (boot handshake depends on it). */
             uint32_t ack = ((~b) >> 5) & 0x06u;
             if (frn_hs_busy[0] > 0) { ack |= 0x01; frn_hs_busy[0]--; }
+            if (getenv("FRN_HS_DBG")) { static int hn; if (hn++ < 400)
+                fprintf(frn_tr_out ? frn_tr_out : stderr,
+                    "[hsdbg] rd 0x50000106 stored=0x%02x -> ret 0x%02x (busy=%d) pc~0x%08x\n",
+                    b & 0xff, (b & 0xf8u) | ack, frn_hs_busy[0], e->pc); }
             return (b & 0xf8u) | ack; } }
     if (a == SPI_DATA) { frn_spi_init();
         if (frn_spi_on) {
