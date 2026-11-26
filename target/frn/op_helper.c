@@ -1582,11 +1582,33 @@ static inline void push32(CPUFRNState *e, uint32_t v) {
     e->regs[15] -= 4; wr32(e, e->regs[15], v);
 }
 /* arm a transfer: delayed => fire after next insn; else immediate */
+/* FRN_BADPC: a SOFTWARE control transfer (call/jmp/ret/reti) to an address BELOW the firmware
+ * base (0x10000000) is always a defect — a NULL or wild function pointer / vtable slot, or a
+ * corrupted return address. All real code lives at >=0x10000000; everything below is RAM, MMIO
+ * or the EIT vector table (which is reached only by HARDWARE vectoring, not by these software
+ * transfers, so it is never a false positive here). A jump to null should be GLARING, so this is
+ * ON BY DEFAULT and halts at the first one. FRN_BADPC_NOHALT=1 logs and keeps going;
+ * FRN_BADPC_OFF=1 disables it entirely. */
+static inline void frn_badpc_check(CPUFRNState *e, uint32_t target, const char *kind) {
+    if (likely(target >= 0x10000000u)) return;
+    static int cfg = -1;   /* -1 unset, 0 off, 1 log-only, 2 halt */
+    if (cfg < 0) cfg = getenv("FRN_BADPC_OFF") ? 0 : getenv("FRN_BADPC_NOHALT") ? 1 : 2;
+    if (cfg == 0) return;
+    fprintf(stderr,
+        "\n[BADPC] *** %s -> 0x%08x  (below firmware base 0x10000000 = NULL / wild pointer) ***\n"
+        "        FROM pc=0x%08x  rp=0x%08x  sp=0x%08x\n"
+        "        r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x\n",
+        kind, target, e->pc, e->rp, e->regs[15],
+        e->regs[4], e->regs[5], e->regs[6], e->regs[7], e->regs[8]);
+    fflush(NULL);
+    if (cfg == 2) exit(0);
+}
 static inline void go(CPUFRNState *e, uint32_t target, int delayed) {
     if (delayed) { e->delay_armed = 1; e->delay_pc = target; }
     else { e->pc = target; }
 }
 static inline void do_call(CPUFRNState *e, uint32_t target, uint32_t ret, int delayed) {
+    frn_badpc_check(e, target, "call");
     e->rp = ret; fa_call(target, ret); go(e, target, delayed);
 }
 
@@ -2343,13 +2365,15 @@ static void frn_interp_one(CPUFRNState *env)
 
     do {
     /* ---- full-word opcodes ---- */
-    if (w == 0x9720) { frn_cc_check(env, env->rp, "ret"); env->pc = env->rp; break; }                 /* ret */
-    if (w == 0x9F20) { frn_cc_check(env, env->rp, "ret:d"); go(env, env->rp, 1); break; }             /* ret:D */
+    if (w == 0x9720) { frn_badpc_check(env, env->rp, "ret"); frn_cc_check(env, env->rp, "ret"); env->pc = env->rp; break; }                 /* ret */
+    if (w == 0x9F20) { frn_badpc_check(env, env->rp, "ret:d"); frn_cc_check(env, env->rp, "ret:d"); go(env, env->rp, 1); break; }             /* ret:D */
     if (w == 0x9730) {                                             /* reti */
         /* no codecheck: reti returns to the INTERRUPTED pc (an arbitrary instruction boundary
-         * mid-function), which is neither a function entry nor a return site. */
+         * mid-function), which is neither a function entry nor a return site. But a reti to a
+         * NULL/wild ptr (corrupted interrupt frame) IS a defect — frn_badpc_check catches it. */
         uint32_t ptr = rd32(env, r[15]); r[15] += 4;
         uint32_t ps = rd32(env, r[15]); r[15] += 4;
+        frn_badpc_check(env, ptr, "reti");
         unpack_ps(env, ps); env->pc = ptr; break;
     }
     if (w == 0x9FA0) { break; }                                    /* nop */
@@ -2363,8 +2387,8 @@ static void frn_interp_one(CPUFRNState *env)
     if (hi8 == 0x9B) { uint32_t xl = rd16(env, pc + 2); r[ri] = ((xc << 16) | xl) & 0xfffff; env->pc = pc + 4; break; } /* ldi:20 */
     /* no codecheck on jmp @ri: it is a tail-call (function entry) OR a jump-table dispatch (a case
      * target inside the function, not an entry/return-site) — ambiguous without the jump tables. */
-    if (t12 == 0x970) { frn_inplace_check(env, pc, r[ri], "jmp");   env->pc = r[ri]; break; }  /* jmp @ri */
-    if (t12 == 0x9F0) { frn_inplace_check(env, pc, r[ri], "jmp:d"); go(env, r[ri], 1); break; }/* jmp:D @ri */
+    if (t12 == 0x970) { frn_badpc_check(env, r[ri], "jmp");   frn_inplace_check(env, pc, r[ri], "jmp");   env->pc = r[ri]; break; }  /* jmp @ri */
+    if (t12 == 0x9F0) { frn_badpc_check(env, r[ri], "jmp:d"); frn_inplace_check(env, pc, r[ri], "jmp:d"); go(env, r[ri], 1); break; }/* jmp:D @ri */
     if (t12 == 0x971) {
         if (pc >= 0x10439674 && pc <= 0x104396d0) {
             static uint32_t _vs[16]; static int _vn;
