@@ -2519,6 +2519,15 @@ static void frn_interp_one(CPUFRNState *env)
             if (hit) fprintf(frn_tr_out ? frn_tr_out : stderr,
                 "[int40*] r12=%08x r4=%08x r5=%08x r6=%08x r7=%08x  pc=%08x rp=%08x\n",
                 svc, env->regs[4], env->regs[5], env->regs[6], env->regs[7], pc, env->rp);
+            /* FRN_FIX_SETFLG=1: CAUSALITY TEST for the set_flg_obj pattern-drop bug.
+             * The recompiled set_flg_obj forwards a dropped pattern (r5) -> set_event_flag_bits
+             * (0x10010984) is called with r5=0 (no-op) so flag waiters never wake. With this on,
+             * force a non-zero pattern (all bits) so the flags actually set. If the candidate then
+             * advances past the deadlock, set_flg_obj is the load-bearing cause (not a benign div). */
+            if (td == 0x40 && env->regs[12] == 0x10010984u && env->regs[5] == 0) {
+                static int fix = -1; if (fix < 0) fix = getenv("FRN_FIX_SETFLG") ? 1 : 0;
+                if (fix) env->regs[5] = 0xffffffffu;
+            }
         }
         /* FRN_CPUCOM_ACK=<code hex>: EXPERIMENT. The CPUCOM task blocks in
          * rcv_mbx(id=4, TMO_FEVR) forever (no DSP posts to mailbox 4). When that
